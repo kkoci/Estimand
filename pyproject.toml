@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "guppy-estimand"
+version = "0.1.0"
+description = "Fault-tolerant physical resource estimation for guppylang/HUGR programs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "guppylang>=1.0.2",
+    "hugr>=0.18.5",
+    "qualtran>=0.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/guppy_estimand"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
