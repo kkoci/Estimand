@@ -49,12 +49,50 @@ References:
     Equation D3.
 ```
 — Beverland, Murali, Troyer et al., "Assessing requirements to scale to
-practical quantum advantage" (arXiv:2211.07629). We did not re-derive or
-independently re-verify this equation against the paper — we are trusting
-Qualtran's (Google's) implementation and citation, which is a published,
-maintained, widely-used library, not a search snippet. If bit-for-bit
-fidelity to the paper matters later, that citation is the place to check
-first.
+practical quantum advantage" (arXiv:2211.07629).
+
+**Update (2026-08-31, two verification passes): all three components behind
+`PhysicalCostModel.make_beverland_et_al()` — the function `estimate.py`
+actually calls — have now been checked against their cited papers. See
+`VERIFICATION.md` for the full derivation, page-by-page citations, and
+hand-reproduced numbers. Do not treat `scheme="beverland"`'s output as a
+faithful reproduction of any single cited paper: two real, confirmed
+discrepancies were found, not just a scope/naming caveat.**
+
+Summary of both passes:
+- Eq. D3/D4 (what this citation originally pointed at) check out exactly
+  against arXiv:2211.07629 (constants A=0.53/B=5.3, functional form
+  confirmed by direct PDF read) — **but `beverland_et_al_model.py` is dead
+  code from this project's perspective**; `PhysicalCostModel.make_beverland_et_al()`
+  never calls it (`VERIFICATION.md` §1-2).
+- `PhysicalParameters.make_beverland_et_al()` and `QECScheme.make_beverland_et_al()`
+  (physical error rate, cycle time, logical-error-rate formula) — **verified
+  exact matches** to the paper's Appendix A and Table V (§3a-3b).
+- `FifteenToOne` (the magic-state factory, cited to Litinski arXiv:1905.06903)
+  — qubit/cycle-count formulas are an **exact match** to the paper's printed
+  page 11 (hand-reproduces 1,146 physical qubits for our `bell_and_t`
+  example). Its noisy-circuit error simulation is also a faithful
+  reimplementation — it reproduces the paper's own published `p_out` number
+  to 4 significant figures **when given the paper's own logical-error
+  constant (a=0.1)**. But the composite `make_beverland_et_al()` preset
+  substitutes Beverland's constant (a=0.03) instead, silently, giving a
+  factory error ≈4.9× smaller than Litinski's own paper would predict for
+  the same parameters (§6-7).
+- `CompactDataBlock` (the data block, cited to Litinski arXiv:1808.02892,
+  page 7 Fig. 9) — **does not match its citation**: the paper states
+  `1.5n+3` tiles (confirmed in three separate places in the paper plus an
+  independent HTML cross-check); Qualtran's code computes `ceil(1.5n)`,
+  dropping the `+3`. This **doubles** the data-block qubit count understatement
+  for small `n_algo_qubits` — for our own `bell_and_t` example, Qualtran
+  reports 1,734 data-block qubits where the cited paper's formula gives
+  3,468, making the reported total `n_phys_qubits` (2,880) a ~38% undercount
+  of the paper-correct total (4,614) (§8).
+
+Net: this is no longer just "half verified, half taken on trust" — it's
+"verified, and two of the three Litinski-sourced pieces have real,
+reproducible gaps against their own citations." See `VERIFICATION.md` §9 for
+the full itemized table and concrete follow-up recommendations (no code
+changes were made in either verification pass).
 
 Verified end-to-end by hand (2026-08-30, qualtran 0.7.0):
 ```python
