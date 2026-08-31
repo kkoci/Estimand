@@ -552,31 +552,29 @@ docstrings claim they are** — this goes beyond the "these are two different
 papers stitched together" scope-caveat from the first pass; the data-block
 piece has an actual arithmetic gap against its own citation.
 
-## Recommendation (updated)
+## Recommendation (updated) — resolved 2026-09-01, see CLAUDE.md
 
-No code changes made in this pass (verification-only, per the task). Two
-concrete follow-ups this finding motivates, for whoever picks this up next:
+Both follow-ups below were acted on. **Update (2026-09-01):**
 
-1. **File or check for an upstream Qualtran issue** on `CompactDataBlock.n_tiles()`
-   missing the `+3` constant from arXiv:1808.02892 page 7 — this looks like
-   a genuine upstream bug, not an intentional simplification (nothing in the
-   code or docstring flags it as one, and the `n_steps_to_consume_a_magic_state=9`
-   sibling constant on the same class *is* transcribed correctly, so this
-   isn't "Qualtran deliberately uses a simplified model").
-2. If `guppy_estimand` needs `n_phys_qubits` to be correct rather than merely
-   "whatever the currently-installed Qualtran computes," consider either (a)
-   monkey-patching/wrapping `CompactDataBlock` locally with the corrected
-   `1.5n+3` formula until upstream fixes it, or (b) prominently surfacing in
-   `README.md`/`EstimateResult.__str__` that the `"beverland"` scheme's
-   physical-qubit count is a known ~37%-for-small-n underestimate relative to
-   its own cited source, so users aren't silently misled. Neither was done
-   here — this file documents the finding; deciding how to act on it is a
-   product decision, not something to silently patch into a verification
-   pass.
-3. If bit-for-bit fidelity to Beverland's own PSSPC method (not just its
-   hardware assumptions) is ever needed, the correct fix is calling
-   `beverland_et_al_model.minimum_time_steps()` / `code_distance()` /
-   `t_states()` directly and building physical-qubit/error formulas from
-   Table V ourselves — i.e., bypassing `PhysicalCostModel.make_beverland_et_al()`
-   entirely — rather than assuming the preset already does this (unchanged
-   from the first pass's recommendation).
+1. **Filed upstream**: [quantumlib/Qualtran#1943](https://github.com/quantumlib/Qualtran/issues/1943)
+   (`CompactDataBlock`'s missing `+3`) and
+   [quantumlib/Qualtran#1944](https://github.com/quantumlib/Qualtran/issues/1944)
+   (the `a=0.03`/`a=0.1` constant substitution, §7). Both open, unfixed, as
+   of this writing.
+2. **Decision on local correction — made, not left open**: #1943 is now
+   patched locally (`src/guppy_estimand/_qualtran_patches.py`,
+   `CorrectedCompactDataBlock`); #1944 is deliberately left unpatched, with a
+   visible runtime + README caveat instead. Full reasoning for treating the
+   two differently — #1943 is an unambiguous transcription bug with one
+   correct fix, #1944 is a genuine cross-paper modeling-composability choice
+   with no single obviously-correct answer — is in `CLAUDE.md`'s
+   2026-09-01 "Update", not duplicated here. `bell_and_t`'s `n_phys_qubits`
+   is now 4,614 (paper-correct, matches this file's §8 hand computation
+   exactly), up from the raw-Qualtran 2,880.
+3. Unchanged from the first pass: if bit-for-bit fidelity to Beverland's own
+   PSSPC method (not just its hardware assumptions) is ever needed, the
+   correct fix is calling `beverland_et_al_model.minimum_time_steps()` /
+   `code_distance()` / `t_states()` directly and building physical-qubit/
+   error formulas from Table V ourselves — i.e., bypassing
+   `PhysicalCostModel.make_beverland_et_al()` entirely — rather than
+   assuming the preset already does this. Nobody has done this yet.

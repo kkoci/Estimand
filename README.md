@@ -52,10 +52,37 @@ Actual output (`python examples/bell_and_t.py`, guppylang 1.0.2 / qualtran 0.7.0
 guppy-estimand result (scheme=beverland, code distance d=17)
   logical qubits:    2
   logical gates:     t: 1, clifford: 2, measurement: 2
-  physical qubits:   2,880
+  physical qubits:   4,614
   runtime:           1.700e-08 hours
-  total error:       2.035e-05
+  total error:       2.036e-05
+  note: physical qubits include a local fix for a confirmed Qualtran bug (https://github.com/quantumlib/Qualtran/issues/1943); see CLAUDE.md.
+  note: total error is understated ~4.9x vs. the cited paper's own constant, unpatched (https://github.com/quantumlib/Qualtran/issues/1944); see CLAUDE.md.
 ```
+
+### ⚠️ Known issues in the `"beverland"` scheme (upstream Qualtran, one patched, one not)
+
+Independent verification against the papers `qualtran.surface_code`'s
+`"beverland"` preset actually cites (see [`VERIFICATION.md`](./VERIFICATION.md))
+found two confirmed bugs, both filed upstream and open as of 2026-09-01:
+
+- **[quantumlib/Qualtran#1943](https://github.com/quantumlib/Qualtran/issues/1943)**
+  — Qualtran's `CompactDataBlock` (the default data-block layout) undercounts
+  physical qubits: it computes `ceil(1.5n)` tiles, but its own cited source
+  (Litinski, arXiv:1808.02892, page 7, Fig. 9) states `1.5n + 3` tiles. For
+  our `bell_and_t` example this meant Qualtran's raw output was **2,880**
+  physical qubits where the cited paper's own formula gives **4,614**.
+  **This project patches it locally** (`guppy_estimand._qualtran_patches.CorrectedCompactDataBlock`)
+  — the number above (4,614) is already corrected. Remove the patch once
+  #1943 lands a real upstream fix (see `CLAUDE.md`).
+- **[quantumlib/Qualtran#1944](https://github.com/quantumlib/Qualtran/issues/1944)**
+  — the `"beverland"` preset feeds Beverland et al.'s logical-error constant
+  (`a=0.03`) into Litinski's magic-state-factory error model instead of
+  Litinski's own constant (`a=0.1`, arXiv:1905.06903 Eq. 7), understating
+  the reported `error` field by roughly **4.9x** relative to what Litinski's
+  own paper would predict for the same factory. **This project does *not*
+  patch this one locally** — see `CLAUDE.md` for why (it's a genuine
+  cross-paper modeling choice, not a single-answer transcription bug like
+  #1943). The `error` field above is the unpatched, understated value.
 
 ## Known limitations (v1)
 

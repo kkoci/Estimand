@@ -91,8 +91,82 @@ Summary of both passes:
 Net: this is no longer just "half verified, half taken on trust" — it's
 "verified, and two of the three Litinski-sourced pieces have real,
 reproducible gaps against their own citations." See `VERIFICATION.md` §9 for
-the full itemized table and concrete follow-up recommendations (no code
-changes were made in either verification pass).
+the full itemized table.
+
+**Update (2026-09-01): both issues filed upstream, and one patched locally.**
+
+Both findings are now filed against Qualtran:
+- [quantumlib/Qualtran#1943](https://github.com/quantumlib/Qualtran/issues/1943)
+  — `CompactDataBlock` missing the `+3` tile constant.
+- [quantumlib/Qualtran#1944](https://github.com/quantumlib/Qualtran/issues/1944)
+  — the composite preset using Beverland's `a=0.03` instead of Litinski's
+  own `a=0.1` for the factory's error model.
+
+Both are open, unfixed, as of this writing. Rather than leave our own
+published numbers silently wrong while waiting on upstream, we did two
+things:
+
+**Part A — always-on caveats (regardless of the Part B decision below).**
+`README.md`'s example output now carries a visible caveat block naming both
+issues with the specific numbers. `EstimateResult.__str__` (`estimate.py`)
+appends the same caveats to every printed `scheme="beverland"` result, not
+just to documentation — so anyone running the tool sees them, not just
+README readers.
+
+**Part B — the decision on whether to locally correct the underlying
+numbers, not just warn about them: patch #1943, do not patch #1944.**
+This was deliberately *not* a symmetric decision — the two issues are
+different in kind, and treating them the same would have been the lazier,
+worse answer:
+
+- **#1943 is patched** (`src/guppy_estimand/_qualtran_patches.py`,
+  `CorrectedCompactDataBlock`, wired in via `estimate._make_beverland_model`
+  whenever `scheme="beverland"` and `data_block_name` is the default
+  `"compact"`). Reasoning: this is an unambiguous transcription bug. The
+  cited paper states one formula (`1.5n+3` tiles), confirmed identically in
+  three separate places in the paper plus an independent HTML
+  cross-check, and Qualtran's code computes a different, simpler formula
+  that happens to be missing exactly the additive term. There is one
+  correct fix, we're confident in it, and the override is small, thin, and
+  clearly scoped (a 6-line method override, not a monkey-patch of
+  Qualtran's own classes).
+- **#1944 is deliberately *not* patched.** Reasoning: unlike #1943, this
+  isn't a transcription error with one obviously correct answer — it's a
+  genuine cross-paper composability question. Beverland's paper doesn't
+  specify a magic-state factory at all (it has its own PSSPC/Table III
+  method instead), and Litinski's paper doesn't specify a hardware/QEC
+  threshold to combine with Beverland's assumptions. Qualtran's current
+  choice — one consistent logical-error-rate constant applied across both
+  the data block and the factory — is a defensible design (a single
+  self-consistent hardware/threshold assumption for the whole device), even
+  though it diverges from the specific numeric example in Litinski's own
+  paper (which was written assuming *his* `a=0.1`, in isolation, not
+  composed with Beverland's hardware assumptions at all). Patching this
+  locally would mean asserting our own opinion of "correct cross-paper
+  composition" in place of Qualtran's, with no stronger claim to being
+  right — and unlike #1943, the upstream issue may reasonably be closed
+  "won't fix" / "working as intended" rather than accepted as a bug. The
+  Part A caveat (a visible, specific "~4.9x understated, see #1944" note)
+  already satisfies "not silently misleading" for this one without taking
+  on that judgment call or the associated maintenance burden.
+
+**Numbers, before/after** (`bell_and_t` example, `d=17`, `scheme="beverland"`,
+default `data_block_name="compact"`):
+
+| Field | Before (raw Qualtran, unpatched) | After (this project's `estimate()`, #1943 patched) |
+|---|---|---|
+| `n_phys_qubits` | 2,880 | **4,614** (paper-correct; matches `VERIFICATION.md` §8's hand computation exactly) |
+| `duration_hr` | 1.700e-08 | 1.700e-08 (unaffected — the tile-count bug doesn't feed into the cycle-count formula) |
+| `error` | 2.035e-05 | 2.036e-05 (tiny increase — the corrected tile count slightly increases the data-block's error contribution; **still the #1944-understated value**, not Litinski's own `a=0.1` number) |
+
+**Removing the #1943 patch once fixed upstream:** do not remove
+`CorrectedCompactDataBlock` on a version bump alone.
+`tests/test_qualtran_patches.py::test_upstream_qualtran_still_has_the_1943_bug`
+asserts Qualtran's own (unpatched) `CompactDataBlock` still returns the
+known-buggy tile count; if a future `qualtran` upgrade fixes #1943, that
+test will start failing — check Qualtran's CHANGELOG/release notes for a
+real landed fix (not a "won't fix" close) before deleting the override and
+switching `_make_beverland_model` back to Qualtran's own `CompactDataBlock`.
 
 Verified end-to-end by hand (2026-08-30, qualtran 0.7.0):
 ```python
