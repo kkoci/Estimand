@@ -1,5 +1,8 @@
+import re
+
+import pytest
 from guppylang import guppy
-from guppylang.std.quantum import cx, h, measure, qubit, t
+from guppylang.std.quantum import cx, discard, h, measure, qubit, t, x
 from qualtran.resource_counting import GateCounts
 from qualtran.surface_code import (
     AlgorithmSummary,
@@ -11,6 +14,7 @@ from qualtran.surface_code import (
 
 from guppy_estimand import estimate
 from guppy_estimand._qualtran_patches import CorrectedCompactDataBlock
+from guppy_estimand.gate_counts import ControlFlowNotSupported, LoopTripCountMissing
 
 
 @guppy
@@ -73,3 +77,54 @@ def test_gidney_fowler_scheme_runs():
     assert result.duration_hr > 0
     assert result.error > 0
     assert result.data_block_name is None
+
+
+def test_estimate_upper_bound_end_to_end():
+    """estimate(upper_bound=True) on a program with both a conditional and a
+    loop: gate_counts is bounded correctly (see
+    tests/test_bounded_control_flow.py for the gate-count-level tests this
+    relies on), is_upper_bound is set, and __str__ says so explicitly."""
+
+    @guppy
+    def circ() -> None:
+        q0 = qubit()
+        ctrl = qubit()
+        h(ctrl)
+        b = measure(ctrl)
+        i = 0
+        while i < 3:
+            if b:
+                h(q0)
+            else:
+                x(q0)
+            i += 1
+        discard(q0)
+
+    compiled = circ.compile()
+
+    # Default (upper_bound=False) is unchanged.
+    with pytest.raises(ControlFlowNotSupported):
+        estimate(compiled)
+
+    # upper_bound=True without a trip count names the missing loop.
+    with pytest.raises(LoopTripCountMissing, match=r"HUGR node \d+"):
+        estimate(compiled, upper_bound=True)
+
+    # Discover the header the same way a real caller would: from the error.
+    try:
+        estimate(compiled, upper_bound=True, loop_trip_counts={})
+        header = None
+    except LoopTripCountMissing as e:
+        header = int(re.search(r"HUGR node (\d+)", str(e)).group(1))
+    assert header is not None
+
+    result = estimate(
+        compiled, scheme="beverland", data_d=17, upper_bound=True, loop_trip_counts={header: 5}
+    )
+
+    assert result.is_upper_bound is True
+    # Entry (h(ctrl), 1 clifford) + 5 * max(then=1, else=1) = 1 + 5 = 6.
+    assert result.gate_counts.clifford == 6
+    assert result.n_algo_qubits == 2
+    assert "UPPER BOUND" in str(result)
+    assert "upper bound" in str(result)  # the per-field annotations, lowercase

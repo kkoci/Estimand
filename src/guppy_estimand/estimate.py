@@ -56,15 +56,25 @@ class EstimateResult:
     data_block_name: str | None = None
     """Which data block variant was used for scheme="beverland" (None for
     other schemes). Only used to decide which caveats apply in __str__."""
+    is_upper_bound: bool = False
+    """True if this result came from upper_bound=True mode: gate_counts
+    (and everything downstream) is a worst-case bound over all branches/
+    loop iterations, NOT a point estimate. See CLAUDE.md 'Bounded control
+    flow (opt-in)'."""
 
     def __str__(self) -> str:
+        header = f"guppy-estimand result (scheme={self.scheme}, code distance d={self.data_d})"
+        if self.is_upper_bound:
+            header += "\n  *** UPPER BOUND -- NOT a point estimate (upper_bound=True) ***"
         lines = [
-            f"guppy-estimand result (scheme={self.scheme}, code distance d={self.data_d})",
+            header,
             f"  logical qubits:    {self.n_algo_qubits}",
             f"  logical gates:     {self.gate_counts}",
-            f"  physical qubits:   {self.n_phys_qubits:,}",
-            f"  runtime:           {self.duration_hr:.3e} hours",
-            f"  total error:       {self.error:.3e}",
+            f"  physical qubits:   {self.n_phys_qubits:,}"
+            + ("  (upper bound)" if self.is_upper_bound else ""),
+            f"  runtime:           {self.duration_hr:.3e} hours"
+            + ("  (upper bound)" if self.is_upper_bound else ""),
+            f"  total error:       {self.error:.3e}" + ("  (upper bound)" if self.is_upper_bound else ""),
         ]
         if self.scheme == "beverland":
             if self.data_block_name == "compact":
@@ -129,6 +139,8 @@ def estimate(
     *,
     scheme: Scheme = "beverland",
     data_d: int = 17,
+    upper_bound: bool = False,
+    loop_trip_counts: dict[int, int] | None = None,
     **scheme_kwargs,
 ) -> EstimateResult:
     """Estimate physical qubit count, runtime, and error for a compiled guppy program.
@@ -144,18 +156,39 @@ def estimate(
             optimized for the target error budget in v1 -- callers must pick
             a distance and check the resulting `error` themselves. See
             CLAUDE.md "Known limitations".
+        upper_bound: If True, opt into worst-case bounding for programs with
+            conditionals/loops instead of raising ControlFlowNotSupported:
+            every conditional contributes the max of its branches (only one
+            ever runs), and every loop's gate count is multiplied by a
+            caller-supplied trip count from ``loop_trip_counts``. The
+            resulting ``EstimateResult`` is a genuine upper bound, not a
+            point estimate -- see CLAUDE.md "Bounded control flow (opt-in)".
+        loop_trip_counts: Required if the program contains a loop and
+            ``upper_bound=True``. Maps a loop's HUGR header-block node ID
+            (an int) to its trip count. Never guessed or defaulted --
+            ``LoopTripCountMissing`` names any loop you didn't supply a
+            count for.
         **scheme_kwargs: Forwarded to
             ``PhysicalCostModel.make_beverland_et_al`` /
             ``.make_gidney_fowler`` (e.g. ``data_block_name``, ``factory_ds``
             for beverland).
 
     Raises:
-        ControlFlowNotSupported: if the program contains a conditional or
-            loop (v1 only supports straight-line programs).
-        UnrecognizedGate: if the program uses a quantum op with no known
+        ControlFlowNotSupported: the program contains a conditional or loop
+            and ``upper_bound`` is False (v1's default is straight-line
+            programs only).
+        UnrecognizedGate: the program uses a quantum op with no known
             GateCounts classification.
+        LoopTripCountMissing: ``upper_bound=True`` and a loop's header has
+            no entry in ``loop_trip_counts``.
+        UnsupportedControlFlowShape: ``upper_bound=True`` and the program's
+            control flow has a shape not hand-verified as boundable (e.g. a
+            ``for`` loop over an iterator, or a loop with an internal
+            ``break``) -- see CLAUDE.md.
     """
-    gate_counts, n_qubits = extract_gate_counts(compiled)
+    gate_counts, n_qubits = extract_gate_counts(
+        compiled, upper_bound=upper_bound, loop_trip_counts=loop_trip_counts
+    )
     algo_summary = AlgorithmSummary(n_algo_qubits=n_qubits, n_logical_gates=gate_counts)
     model = _build_model(scheme, data_d, **scheme_kwargs)
 
@@ -168,4 +201,5 @@ def estimate(
         duration_hr=model.duration_hr(algo_summary),
         error=model.error(algo_summary),
         data_block_name=scheme_kwargs.get("data_block_name", "compact") if scheme == "beverland" else None,
+        is_upper_bound=upper_bound,
     )

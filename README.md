@@ -86,19 +86,98 @@ found two confirmed bugs, both filed upstream and open as of 2026-09-01:
 
 ## Known limitations (v1)
 
-- **Straight-line programs only.** Guppy `if`/`else` compiles to a HUGR
-  `CFG`, and loops to a `TailLoop`/`CFG`. Naively summing gate counts across
-  all HUGR nodes would count every branch (only one runs) and undercount
-  loop bodies (which run N times but appear once in the graph). Rather than
-  silently produce a wrong number, `estimate()` raises
-  `ControlFlowNotSupported` if it finds one. See `CLAUDE.md` for the
-  verified example that drove this decision.
+- **Straight-line programs only, by default.** Guppy `if`/`else` and loops
+  (`while`, `for`) compile to a HUGR `CFG` — loops as a `CFG` with a back
+  edge, *not* a `TailLoop` node (verified by hand; see `CLAUDE.md` "HUGR
+  quirks"). Naively summing gate counts across all HUGR nodes would count
+  every branch (only one runs) and undercount loop bodies (which run N
+  times but appear once in the graph). Rather than silently produce a
+  wrong number, `estimate()` raises `ControlFlowNotSupported` if it finds
+  one — *unless* you opt into bounded mode, see below.
 - **`data_d` (code distance) is not auto-selected** for a target logical
   error rate. You choose a distance and check the resulting `error` field
   yourself.
 - **Unrecognized gates fail loudly**, not silently. If guppylang adds a new
   quantum op, `estimate()` raises `UnrecognizedGate` rather than dropping it
   from the count.
+
+## Bounded control flow (opt-in, `upper_bound=True`)
+
+For programs with conditionals and/or loops, pass `upper_bound=True` to get
+a **worst-case upper bound** instead of `ControlFlowNotSupported` — every
+conditional contributes the max of its branches (only one ever runs at
+runtime), and every loop's gate count is multiplied by a trip count *you*
+supply. **This is a bound, not a point estimate** — `EstimateResult` says
+so explicitly, in both `is_upper_bound` and the printed output:
+
+```python
+from guppylang import guppy
+from guppylang.std.quantum import qubit, h, x, measure, discard
+from guppy_estimand import estimate, LoopTripCountMissing
+
+@guppy
+def circ() -> None:
+    q0 = qubit()
+    ctrl = qubit()
+    h(ctrl)
+    b = measure(ctrl)
+    i = 0
+    while i < 3:
+        if b:
+            h(q0)
+        else:
+            x(q0)
+        i += 1
+    discard(q0)
+
+compiled = circ.compile()
+
+# Loops are keyed by the HUGR node ID of their header block. You don't need
+# to go find it yourself -- LoopTripCountMissing names it:
+try:
+    estimate(compiled, upper_bound=True)
+except LoopTripCountMissing as e:
+    print(e)  # "...loop whose header is HUGR node 8, but no trip count..."
+
+result = estimate(compiled, upper_bound=True, loop_trip_counts={8: 5})
+print(result)
+```
+
+```
+guppy-estimand result (scheme=beverland, code distance d=17)
+  *** UPPER BOUND -- NOT a point estimate (upper_bound=True) ***
+  logical qubits:    2
+  logical gates:     clifford: 6, measurement: 1
+  physical qubits:   4,614  (upper bound)
+  runtime:           0.000e+00 hours  (upper bound)
+  total error:       0.000e+00  (upper bound)
+  ...
+```
+
+**Trip counts are the caller's responsibility.** They're never guessed or
+defaulted to 1 — `LoopTripCountMissing` names the exact loop (by HUGR node
+ID) if you forget one, and never silently assumes a value. If your trip
+count is wrong, the bound is wrong; `guppy_estimand` has no way to check it
+against your program's actual runtime behavior.
+
+**Scope, as of this writing** (see `CLAUDE.md` "Bounded control flow
+(opt-in)" for the full derivation and why each limit exists):
+- Sequential and nested conditionals: supported, verified.
+- `while`-style loops (single `CFG` with one back edge): supported,
+  verified, including loop-containing-conditional and
+  conditional-containing-loop.
+- `for` loops over an iterator (`for x in range(...)`, etc.): **not
+  supported** — these compile to a structurally different, more complex
+  shape (a nested `CFG` plus iterator-protocol machinery) that hasn't been
+  hand-verified yet. Raises `UnsupportedControlFlowShape`.
+- A loop with an internal `break`/early exit, or a `TailLoop` HUGR node
+  (not something guppylang 1.0.2 actually produces, but kept as an
+  explicit unsupported case rather than silently mishandled if it ever
+  shows up): **not supported**, same reason.
+- `n_qubits` is **not** multiplied by a loop's trip count (only gate counts
+  are) — see `CLAUDE.md` for the reasoning (guppy's linear qubit typing
+  means a loop body's qubit is freed and reused each iteration, not
+  allocated `N` times over).
 
 ## Project layout
 

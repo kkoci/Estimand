@@ -289,22 +289,161 @@ than via QIR.
   string rather than a real `.py` file on disk. Always compile from an
   actual file when testing.
 
+**Update (2026-09-02), added while building bounded control-flow
+support (`upper_bound=True`, see below) — verified by hand against
+compiled examples, not assumed from the note above (which was written
+against a single if/else and never checked composition, loops, or the
+optimizer's effect on repeated gates):**
+
+- **A guppy function's `if`/`else` blocks all share ONE `CFG` per
+  function, not one `CFG` per conditional.** Two sequential, independent
+  `if`/`else` statements in the same function produce a *single* `CFG`
+  node whose children include *all* `DataflowBlock`s from *both*
+  conditionals as siblings (verified: 7 `DataflowBlock`/`ExitBlock`
+  children for a 2-conditional function, not 2 separate `CFG`s). Grouping
+  by "children of the CFG" tells you nothing about which blocks pair up as
+  branches of which conditional — you have to follow the actual
+  control-flow edges. **`Hugr.output_neighbours(node)` gives a
+  `DataflowBlock`'s successor block(s)** (confirmed via a live example: a
+  branch-point block had 2 successors, a straight-line/merge block had 1,
+  `ExitBlock` had 0) — this is the edge accessor `gate_counts.py`'s bounded
+  walker uses to reconstruct the actual branch/merge graph.
+- **Loops do NOT compile to a `TailLoop` node in guppylang 1.0.2 / hugr
+  0.18.5.** Both `while` and `for ... in range(...)` were compiled and
+  inspected directly; neither produced a `TailLoop` anywhere in the HUGR.
+  Instead:
+  - `while` compiles to a `CFG` with a genuine **cycle**: a `DataflowBlock`
+    branches back to an earlier `DataflowBlock` (verified:
+    `output_neighbours` on the loop body block returned the *header*
+    block, confirming a back edge). The header block itself contains the
+    loop-condition check, wrapped in a `Conditional`/`Case` pair that
+    produces the `Some`/`None`-tagged value the CFG branches on — this
+    `Conditional` is boilerplate for encoding the branch decision, not a
+    second "real" conditional.
+  - `for ... in range(...)` is structurally more complex: it produces a
+    **nested `CFG`** (a second `CFG` node inside a `DataflowBlock`/`Case`
+    of the outer one) plus extra `Conditional`/`Case`/`prelude.panic`
+    machinery for the iterator's `Option`-unwrap protocol
+    (`MakeTuple`/`UnpackTuple` for the `(start, stop, step)` state,
+    `arithmetic.int.*` comparisons, a `panic` case for the
+    "unwrap on `None`" branch that should be unreachable). **This shape is
+    not supported by the bounded walker** (raises
+    `UnsupportedControlFlowShape`) — only single-CFG, single-back-edge
+    `while`-style loops are handled. This is a deliberate scope decision,
+    not an oversight: handling the nested-CFG/iterator-protocol shape
+    correctly would need its own separate hand-verification pass.
+  - Because loops are CFG back edges rather than an explicit node type,
+    **a loop is keyed, for `loop_trip_counts`, by the HUGR node ID of its
+    header block** (the back-edge *target*) — chosen over "order of
+    appearance" because node IDs are unambiguous by construction (no
+    debate about DFS traversal order for loops nested under different
+    conditional branches), and the tool tells the caller the exact ID to
+    use via `LoopTripCountMissing`'s error message, so opacity of raw node
+    IDs isn't a practical usability problem.
+  - `ops.TailLoop` is kept as an explicit, deliberately-unsupported case
+    (`UnsupportedControlFlowShape`) in the bounded walker rather than given
+    speculative handling — since no real example was ever observed, any
+    handling written for it would be a guess, which this project's
+    correctness bar doesn't allow. If a real `TailLoop` ever shows up
+    (a different guppylang version, or hand-constructed HUGR), it needs
+    its own hand-verification pass before being supported.
+- **`compile()` applies an optimization pass by default
+  (`OptimizationLevel.Default`) that cancels repeated identical adjacent
+  gates.** Verified directly: `x(q0); x(q0); x(q0)` compiles down to a
+  *single* `X` op, not three. `h(q0); x(q0); h(q0)` (non-adjacent-repeat,
+  mixed gate types) survives intact as 3 separate ops. This is a second,
+  distinct optimizer trap beyond the already-documented "`if True`
+  constant-folds away" one above — **when writing a test that needs N
+  literal gate ops to survive compilation, don't write the same gate N
+  times in a row; use a mix of distinct gate types, or verify the actual
+  compiled op count directly rather than assuming the source line count.**
+  This cost real debugging time while building `tests/test_bounded_control_flow.py`
+  (a test's "else branch has 3 clifford ops" assumption was silently wrong
+  by a factor of 3 until this was traced down).
+- A CFG's **entry block is its first child** in `Hugr.children(cfg_node)`
+  order (a HUGR structural invariant: the CFG's own input signature must
+  match its entry block's), **not** "whichever child block has no
+  predecessor." The naive in-degree-0 heuristic is wrong whenever the
+  function body's very first statement is a loop (no straight-line code
+  before the `while`): the entry block IS the loop header in that case,
+  and has an *incoming* back edge from the loop body, so it does NOT have
+  in-degree 0. Learned this from a live, reproducible test failure before
+  switching to the first-child rule.
+
 ## Known limitations (see README for the user-facing version)
 
-- Straight-line (control-flow-free) guppy programs only, by design (see
-  above).
+- Straight-line (control-flow-free) guppy programs only, by default. See
+  "Bounded control flow (opt-in)" below for the `upper_bound=True`
+  alternative added 2026-09-02, which is scoped and limited, not a full
+  replacement.
 - `data_d` (surface-code distance) is a caller-supplied parameter, not
   auto-selected to hit a target logical error rate.
 - Any quantum op not in `gate_counts.py`'s classification tables raises
   `UnrecognizedGate` rather than being silently dropped.
 
+## Bounded control flow (opt-in) — added 2026-09-02
+
+Implements the "possible future work" item below: `extract_gate_counts()`
+and `estimate()` accept `upper_bound: bool = False` and
+`loop_trip_counts: dict[int, int] | None = None`. This is an **opt-in
+alternative**, not a replacement for the default straight-line-only path
+(which is unchanged and still raises `ControlFlowNotSupported`).
+
+**What `upper_bound=True` does:**
+- Every conditional (`if`/`else`, and any HUGR `Conditional` node
+  encountered, including the boilerplate ones a `while` loop's condition
+  check compiles to) contributes the **max** of its branches' gate counts
+  — not the sum — since only one branch ever executes. Verified correct
+  for **sequential, independent conditionals** specifically (not just a
+  single conditional in isolation): two sequential `if`/`else` blocks in
+  one function share a single CFG (see "HUGR quirks" above), so the
+  implementation does real graph analysis (DFS + a longest-weighted-path
+  DP over the CFG's block graph, max at each branch point) rather than
+  naively summing or maxing over "all DataflowBlock children of the CFG"
+  as one flat set — see `tests/test_bounded_control_flow.py::test_sequential_independent_conditionals_sum_of_max_per_conditional`,
+  which is deliberately constructed so "sum of max-per-conditional",
+  "sum of all branches", and "max of all branches" are three different
+  numbers, to catch exactly this class of bug.
+- Every loop (a CFG back edge — see "HUGR quirks" above; NOT a `TailLoop`)
+  requires a caller-supplied trip count, keyed by the loop header's HUGR
+  node ID in `loop_trip_counts`. **Gate counts are multiplied by the trip
+  count; `n_qubits` is not.** This is a deliberate, documented modeling
+  choice (`gate_counts.py::_scale_gates_only`): guppy's linear qubit typing
+  forces a qubit allocated inside a loop body to be freed within the same
+  iteration (an allocated-but-unconsumed qubit is a compile error — see
+  "HUGR quirks" above), so a loop is assumed to reuse one physical qubit
+  slot across iterations rather than needing `trip_count` distinct ones.
+  If a future guppy version or usage pattern breaks that assumption (a
+  qubit that somehow outlives one iteration), this would need revisiting —
+  nothing in the current HUGR walk detects that case.
+- Missing a trip count for a loop that's present raises
+  `LoopTripCountMissing`, naming the loop's header node ID — never
+  defaulted to 1 or guessed.
+- Composition (loop containing a conditional, conditional containing a
+  loop) is handled by the same general recursive algorithm, not special
+  cased — see `tests/test_bounded_control_flow.py::test_loop_containing_a_conditional`
+  and `::test_conditional_containing_a_loop`.
+- `EstimateResult.is_upper_bound` and its `__str__` explicitly say
+  "UPPER BOUND -- NOT a point estimate" and annotate each affected field,
+  rather than returning a number that looks like a normal estimate.
+
+**What's explicitly NOT supported** (raises `UnsupportedControlFlowShape`
+rather than silently guessing): `for` loops over an iterator (nested
+CFG + iterator-protocol machinery — see "HUGR quirks" above), a loop with
+more than one back edge into the same header, a loop header without
+exactly one "into the loop" and one "exit" successor, a loop body with an
+internal early exit (e.g. `break`), and `TailLoop` nodes (never observed
+produced by this guppylang/hugr version). Each of these would need its own
+hand-verification pass, per this project's correctness bar, before being
+supported — none has been done.
+
 ## Possible future work (not started)
 
-- Support straight-line-with-known-bounds control flow: e.g. accept a
-  caller-supplied loop trip count and multiply the loop body's gate counts,
-  or compute a worst-case (all-branches-summed) upper bound for
-  conditionals with an explicit `--upper-bound` flag so the number is
-  honestly labeled as a bound rather than an estimate.
+- ~~Support straight-line-with-known-bounds control flow...~~ **Done,
+  2026-09-02 — see "Bounded control flow (opt-in)" above.** Remaining gaps
+  within that feature (not "future work" so much as known scope limits):
+  `for`-loop/iterator support, loops with internal `break`, `TailLoop`
+  support if it's ever actually observed produced.
 - Auto-select `data_d` for a target total error budget (bisection over
   Qualtran's `model.error()`).
 - `hugr-qir`-based cross-check: independently estimate from the QIR output
