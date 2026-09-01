@@ -324,3 +324,210 @@ def test_for_loop_over_range_is_unsupported():
     compiled = circ.compile()
     with pytest.raises((UnsupportedControlFlowShape, LoopTripCountMissing)):
         extract_gate_counts(compiled, upper_bound=True, loop_trip_counts={})
+
+
+# --- Part 5: nested loops ---
+#
+# A while loop nested inside another while loop was NOT covered by the
+# loop-in-conditional / conditional-in-loop composition tests above, and
+# turned out to expose a real bug (RecursionError): the CFG-block DP's
+# restricted "one pass through an outer loop's body" walk (`dp_within` in
+# gate_counts.py) did not recognize a nested loop header as anything other
+# than an ordinary branch point, so it never stopped at the inner loop's
+# own back edge. Fixed in gate_counts.py by making `dp_within` recognize
+# and fully unroll a nested header (its own trip count, its own body walk)
+# before continuing past it -- see the docstring on `dp_within` there, and
+# CLAUDE.md "HUGR quirks" (2026-09-03) for the hand-verified HUGR structure
+# (still ONE CFG, two back edges, inner loop's node set entirely absorbed
+# into the outer loop's natural-loop node set).
+
+
+def _discover_loop_headers(compiled) -> list[int]:
+    """Test helper: repeatedly calls extract_gate_counts with an
+    ever-growing loop_trip_counts dict (placeholder count of 1 each time),
+    recording each header LoopTripCountMissing names, until it stops
+    raising. Returns headers in DISCOVERY order -- which, given dp() checks
+    an outer header before recursing into its body via dp_within, means
+    outer loops are discovered before loops nested inside them."""
+    found: dict[int, int] = {}
+    order: list[int] = []
+    for _ in range(20):
+        try:
+            extract_gate_counts(compiled, upper_bound=True, loop_trip_counts=found)
+            return order
+        except LoopTripCountMissing as e:
+            import re
+
+            m = re.search(r"HUGR node (\d+)", str(e))
+            assert m, str(e)
+            header = int(m.group(1))
+            order.append(header)
+            found[header] = 1
+    raise AssertionError("did not converge on all loop headers")
+
+
+def _nested_while_loops_circ():
+    @guppy
+    def circ() -> None:
+        q0 = qubit()
+        i = 0
+        while i < 3:
+            j = 0
+            while j < 2:
+                h(q0)  # inner body: should scale by outer_trip * inner_trip
+                j += 1
+            i += 1
+        discard(q0)
+
+    return circ
+
+
+def test_nested_loop_no_longer_crashes_and_scales_inner_body_by_product():
+    """Regression test for the RecursionError bug described above. Inner
+    loop body gates must scale by outer_trip * inner_trip, checked across
+    several (M, N) pairs including zeros -- not M+N, not just M, not just N."""
+    compiled = _nested_while_loops_circ().compile()
+    headers = _discover_loop_headers(compiled)
+    assert len(headers) == 2
+    outer, inner = headers  # outer discovered first, see _discover_loop_headers
+
+    for outer_trip, inner_trip in [(3, 2), (5, 1), (1, 7), (0, 5), (4, 0)]:
+        gate_counts, n_qubits = extract_gate_counts(
+            compiled,
+            upper_bound=True,
+            loop_trip_counts={outer: outer_trip, inner: inner_trip},
+        )
+        assert gate_counts.clifford == outer_trip * inner_trip
+        # QAlloc is outside both loops (before the outer `while`) -- never
+        # scaled by either trip count.
+        assert n_qubits == 1
+
+
+def test_nested_loop_outer_only_gates_scale_by_outer_trip_alone():
+    """A gate in the outer loop's body but OUTSIDE the inner loop must
+    scale by outer_trip only; a gate inside the inner loop must scale by
+    outer_trip * inner_trip -- in the SAME program, so a bug that collapses
+    the two distinctions (e.g. scaling everything in the outer body by
+    outer_trip*inner_trip, or by outer_trip+inner_trip) is caught."""
+
+    @guppy
+    def circ() -> None:
+        q0 = qubit()
+        i = 0
+        while i < 3:
+            x(q0)  # outer-body-only: scales by outer_trip alone
+            j = 0
+            while j < 2:
+                h(q0)  # inner body: scales by outer_trip * inner_trip
+                j += 1
+            i += 1
+        discard(q0)
+
+    compiled = circ.compile()
+    headers = _discover_loop_headers(compiled)
+    assert len(headers) == 2
+    outer, inner = headers
+
+    for outer_trip, inner_trip in [(3, 2), (5, 1), (2, 4)]:
+        gate_counts, _ = extract_gate_counts(
+            compiled,
+            upper_bound=True,
+            loop_trip_counts={outer: outer_trip, inner: inner_trip},
+        )
+        # x(q0) contributes outer_trip clifford; h(q0) contributes
+        # outer_trip*inner_trip clifford; both are the "clifford" bucket.
+        expected = outer_trip * (1 + inner_trip)
+        assert gate_counts.clifford == expected
+
+
+def test_nested_loop_qubit_allocated_in_inner_body_not_scaled_by_either_trip():
+    """A qubit allocated (and freed) fresh each INNERMOST iteration must
+    still count once, not outer_trip*inner_trip times -- the single-loop
+    n_qubits reasoning (guppy's linear qubit typing forces free-within-one-
+    iteration, so the same physical slot is reused) extends unchanged to
+    nested loops: _scale_gates_only leaves n_qubits untouched at every
+    nesting level, including the new nested-header branch in dp_within."""
+
+    @guppy
+    def circ() -> None:
+        i = 0
+        while i < 3:
+            j = 0
+            while j < 2:
+                q = qubit()
+                h(q)
+                discard(q)
+                j += 1
+            i += 1
+
+    compiled = circ.compile()
+    headers = _discover_loop_headers(compiled)
+    assert len(headers) == 2
+    outer, inner = headers
+
+    gate_counts, n_qubits = extract_gate_counts(
+        compiled, upper_bound=True, loop_trip_counts={outer: 3, inner: 2}
+    )
+    assert gate_counts.clifford == 6  # 3 * 2
+    assert n_qubits == 1  # NOT 6
+
+
+def test_nested_loop_missing_trip_count_names_whichever_header_is_missing():
+    """LoopTripCountMissing must name the actual missing header, whether
+    that's the outer loop (nothing supplied yet) or specifically the inner
+    loop (outer supplied, inner still missing) -- not always report the
+    outermost header regardless of which one is actually absent."""
+    compiled = _nested_while_loops_circ().compile()
+    headers = _discover_loop_headers(compiled)
+    outer, inner = headers
+
+    # Nothing supplied: outer is reported first (dp() checks its own
+    # header before recursing into dp_within for the body).
+    with pytest.raises(LoopTripCountMissing, match=rf"HUGR node {outer}\b"):
+        extract_gate_counts(compiled, upper_bound=True, loop_trip_counts={})
+
+    # Outer supplied, inner missing: the INNER header must be named, not
+    # the outer one again and not a generic/wrong message.
+    with pytest.raises(LoopTripCountMissing, match=rf"HUGR node {inner}\b"):
+        extract_gate_counts(compiled, upper_bound=True, loop_trip_counts={outer: 3})
+
+
+def test_nested_loop_composes_with_conditional_in_inner_body():
+    """A conditional inside the inner loop's body: the heavier branch's
+    gates should scale by outer_trip * inner_trip, same as any other
+    inner-loop-body gate -- checks the fix composes with the pre-existing
+    (already-tested) conditional max-of-branches logic, not just loops
+    alone."""
+
+    @guppy
+    def circ() -> None:
+        q0 = qubit()
+        ctrl = qubit()
+        h(ctrl)
+        b = measure(ctrl)
+        i = 0
+        while i < 3:
+            j = 0
+            while j < 2:
+                if b:
+                    h(q0)
+                else:
+                    h(q0)
+                    x(q0)  # heavier branch: 2 clifford
+                j += 1
+            i += 1
+        discard(q0)
+
+    compiled = circ.compile()
+    headers = _discover_loop_headers(compiled)
+    outer, inner = headers
+    outer_trip, inner_trip = 3, 2
+
+    gate_counts, _ = extract_gate_counts(
+        compiled,
+        upper_bound=True,
+        loop_trip_counts={outer: outer_trip, inner: inner_trip},
+    )
+    # Entry (h(ctrl), 1 clifford) + outer_trip*inner_trip * max(1, 2).
+    expected = 1 + outer_trip * inner_trip * 2
+    assert gate_counts.clifford == expected

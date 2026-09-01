@@ -399,17 +399,55 @@ def _walk_cfg(hugr: Hugr, cfg_node: Node, loop_trip_counts: dict[int, int]) -> _
 
     own_cost = {b: _walk_region(hugr, b, loop_trip_counts) for b in blocks}
     memo: dict[Node, _RegionCost] = {}
+    memo_within: dict[tuple[Node, Node], _RegionCost] = {}
 
-    def dp_within(node: Node, header: Node) -> _RegionCost:
-        """DAG-DP for one pass through a loop body, restricted to nodes
-        reachable without re-entering the header (the back edge target)."""
-        succs = [s for s in succ[node] if s != header]
+    def dp_within(node: Node, stop_header: Node) -> _RegionCost:
+        """DAG-DP for one pass through ``stop_header``'s loop body: the cost
+        from ``node`` up to (but not past) an edge that targets
+        ``stop_header`` -- that edge is the back edge marking the end of one
+        iteration.
+
+        NESTED LOOPS: if a *different* loop's header is reached along the
+        way (its own back edge, distinct from stop_header's), that inner
+        loop is NOT just another branch point -- it must be fully unrolled
+        with its own trip count first (own gates * (trip+1) + body * trip),
+        and only then does traversal continue, from the inner loop's exit
+        successor, still bounded by stop_header. Skipping this and treating
+        the inner header as a plain branch node is wrong two ways: it
+        infinite-recurses (the inner loop's own back edge is never
+        filtered out, since only stop_header is excluded from `succ`), and
+        even if it didn't, it would silently drop the inner trip-count
+        multiplication -- the inner body's gates need to be scaled by
+        *both* the inner and outer trip counts (this happens automatically
+        here because the caller scales this function's entire return value
+        by the outer trip count).
+        """
+        cache_key = (node, stop_header)
+        if cache_key in memo_within:
+            return memo_within[cache_key]
+
+        if node in headers and node != stop_header:
+            entry_succ, exit_succ, _inner_loop_nodes = headers[node]
+            inner_trip_count = _get_trip_count(node, loop_trip_counts)
+            inner_body_once = dp_within(entry_succ, node)
+            result = (
+                _scale_gates_only(own_cost[node], inner_trip_count + 1)
+                + _scale_gates_only(inner_body_once, inner_trip_count)
+                + dp_within(exit_succ, stop_header)
+            )
+            memo_within[cache_key] = result
+            return result
+
+        succs = [s for s in succ[node] if s != stop_header]
         own = own_cost[node]
         if not succs:
-            return own
-        if len(succs) == 1:
-            return own + dp_within(succs[0], header)
-        return own + _reduce_max_region_cost([dp_within(s, header) for s in succs])
+            result = own
+        elif len(succs) == 1:
+            result = own + dp_within(succs[0], stop_header)
+        else:
+            result = own + _reduce_max_region_cost([dp_within(s, stop_header) for s in succs])
+        memo_within[cache_key] = result
+        return result
 
     def dp(node: Node) -> _RegionCost:
         if node in memo:

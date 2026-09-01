@@ -370,6 +370,90 @@ optimizer's effect on repeated gates):**
   in-degree 0. Learned this from a live, reproducible test failure before
   switching to the first-child rule.
 
+**Update (2026-09-03), nested loops — verified by hand, and a real bug
+found and fixed, not just confirmed-correct-by-luck:**
+
+- **A `while` loop nested inside another `while` loop still compiles to
+  ONE CFG** (no nested `CFG` node — unlike `for`-over-an-iterator, which
+  does nest). Verified directly: compiling
+  ```python
+  i = 0
+  while i < 3:
+      j = 0
+      while j < 2:
+          h(q0)
+          j += 1
+      i += 1
+  ```
+  produced a single `CFG` node with 6 `DataflowBlock`/`ExitBlock` children
+  and exactly two back edges in its block graph — inner `44 -> 29` and
+  outer `53 -> 5` (concrete node IDs from one compile; renumber per
+  program). The inner loop's entire node set `{29, 44}` was, as expected,
+  absorbed into the outer loop's natural-loop node set (`_natural_loop_nodes`
+  computed `{5, 53, 29, 22, 44}` for the outer header) — the outer loop's
+  body legitimately contains a second, independent loop structure inside
+  it, not a special case requiring different back-edge detection.
+- **This exposed a real bug**, not just an unverified gap: `_walk_cfg`'s
+  `dp_within` helper (the restricted DP used for "cost of one pass through
+  an outer loop's body") did not check whether a node it was visiting was
+  itself a *different* loop's header. It only ever filtered out the
+  *outer* loop's back-edge target from a node's successors — so when
+  traversal reached the inner loop's header (node 29 above) mid-body, that
+  node's own back edge (`44 -> 29`) was never excluded (`dp_within`'s
+  exclusion list only ever contained the *outer* header, 5), and the walk
+  recursed `29 -> {53, 44}`, then `44 -> 29`, forever. **Confirmed
+  empirically as a `RecursionError`** (not a hand-derived guess) by
+  running `extract_gate_counts(..., upper_bound=True, loop_trip_counts={outer: 1})`
+  on the nested-loop example above before any fix was applied.
+- **Fix**: `dp_within(node, stop_header)` now checks `node in headers and
+  node != stop_header` first. If true (a nested loop's header), it fully
+  unrolls that inner loop — its own trip count, its own recursive
+  `dp_within` call scoped to *its own* header as the new stop point — and
+  only then continues traversal (still bounded by the original
+  `stop_header`) from the inner loop's exit successor. Because the
+  caller (`dp`, for the outer loop) scales `dp_within`'s entire return
+  value by the *outer* trip count, and the inner unrolling inside
+  `dp_within` already scales the inner body by the *inner* trip count, an
+  innermost loop body's gates end up correctly scaled by
+  `outer_trip * inner_trip` — verified against the actual walker output
+  across `(outer_trip, inner_trip)` pairs including `(0, N)` and `(M, 0)`
+  edge cases, all matching the product exactly, in
+  `tests/test_bounded_control_flow.py::test_nested_loop_no_longer_crashes_and_scales_inner_body_by_product`.
+  A gate in the outer body but *outside* the inner loop was separately
+  confirmed to scale by `outer_trip` alone, in the same program as an
+  inner-loop-body gate scaling by the product — see
+  `::test_nested_loop_outer_only_gates_scale_by_outer_trip_alone`, chosen
+  specifically to catch a fix that collapses this distinction (e.g.
+  scaling the whole outer body uniformly by the product).
+- **`loop_trip_counts` keying stays unambiguous for nested loops**: the
+  inner and outer headers are different HUGR node IDs by construction (no
+  special-casing needed to keep them distinct), and `LoopTripCountMissing`
+  correctly names *whichever* header is actually missing — the outer
+  header first if nothing has been supplied yet (since `dp` checks its own
+  header before recursing into `dp_within` for the body), then
+  specifically the inner header once the outer count has been supplied but
+  the inner hasn't. Verified via
+  `::test_nested_loop_missing_trip_count_names_whichever_header_is_missing`
+  (not assumed from the single-loop error-message behavior).
+- **The single-loop `n_qubits`-not-scaled reasoning extends unchanged to
+  nested loops**, verified rather than assumed: a qubit allocated (and
+  freed) fresh each *innermost* iteration was confirmed to still count
+  once overall (`n_qubits == 1`), not `outer_trip * inner_trip` times —
+  because `_scale_gates_only` is applied at *every* nesting level
+  (including the new nested-header branch inside `dp_within`) and never
+  touches `.n_qubits` at any level, the non-scaling composes automatically
+  without needing separate reasoning per nesting depth. See
+  `::test_nested_loop_qubit_allocated_in_inner_body_not_scaled_by_either_trip`.
+- Composition with the pre-existing (already-tested) conditional-max
+  logic was also checked with a conditional inside the inner loop's body,
+  confirmed to scale the heavier branch's gates by `outer_trip *
+  inner_trip` — see `::test_nested_loop_composes_with_conditional_in_inner_body`.
+  This wasn't a given: the fix only touches the *nested-header* branch of
+  `dp_within`, so confirming it doesn't interact badly with the
+  *branch-point* (non-header, `len(succs) > 1`) branch of the same
+  function was worth checking explicitly rather than assuming they don't
+  interfere with each other.
+
 ## Known limitations (see README for the user-facing version)
 
 - Straight-line (control-flow-free) guppy programs only, by default. See
@@ -423,6 +507,13 @@ alternative**, not a replacement for the default straight-line-only path
   loop) is handled by the same general recursive algorithm, not special
   cased — see `tests/test_bounded_control_flow.py::test_loop_containing_a_conditional`
   and `::test_conditional_containing_a_loop`.
+- **Nested loops** (a `while` inside another `while`) are supported: the
+  inner loop's body gates scale by the *product* of both trip counts,
+  gates in the outer body but outside the inner loop scale by the outer
+  trip count alone, and `loop_trip_counts` keying / `LoopTripCountMissing`
+  stay unambiguous per loop. This was not free — see "HUGR quirks"
+  (2026-09-03) for a real `RecursionError` bug this found and fixed in
+  `dp_within`, not just a gap that happened to already work.
 - `EstimateResult.is_upper_bound` and its `__str__` explicitly say
   "UPPER BOUND -- NOT a point estimate" and annotate each affected field,
   rather than returning a number that looks like a normal estimate.
