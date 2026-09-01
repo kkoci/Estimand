@@ -170,18 +170,83 @@ against your program's actual runtime behavior.
   supported** — these compile to a structurally different, more complex
   shape (a nested `CFG` plus iterator-protocol machinery) that hasn't been
   hand-verified yet. Raises `UnsupportedControlFlowShape`.
-- A loop with an internal `break`/early exit, or a `TailLoop` HUGR node
-  (not something guppylang 1.0.2 actually produces, but kept as an
-  explicit unsupported case rather than silently mishandled if it ever
-  shows up): **not supported**, same reason.
+- A loop with an internal `break`/early exit, or a `TailLoop` HUGR node:
+  **not supported.** Plain `while`/`for` *statements* never compile to
+  `TailLoop` in guppylang 1.0.2 — but the `array(x for _ in range(n))`
+  array-*comprehension* idiom does (found via the real-world stress test
+  below), so this is a real, reachable case, not a hypothetical.
+- **Calling another function that wasn't inlined at the call site**: **not
+  supported**, raises `CallNotSupported`. Neither walker follows
+  `ops.Call` edges into a separately-compiled callee — its gates are
+  entirely invisible. This was found to matter for real code (see below):
+  `guppylang.std.quantum.discard_array`, used by essentially every
+  real-world guppy program that allocates a qubit array, is compiled as a
+  non-inlined function call, not inlined.
 - `n_qubits` is **not** multiplied by a loop's trip count (only gate counts
   are) — see `CLAUDE.md` for the reasoning (guppy's linear qubit typing
   means a loop body's qubit is freed and reused each iteration, not
   allocated `N` times over).
 
+## Real-world stress test: QFT from kkoci/Qshelf
+
+`bell_and_t` above is a hand-written toy. [`examples/qft_n.py`](./examples/qft_n.py)
+runs guppy_estimand against a real, independently-written algorithm — QFT
+from [kkoci/Qshelf](https://github.com/kkoci/Qshelf) — as the first
+realistic stress test of the whole pipeline. **Result: a genuine success on
+the algorithm itself, plus two real, previously-unknown gaps that this
+stress test is what found them.** See `CLAUDE.md` "Real-world stress test"
+for the full writeup; summary:
+
+- **QFT's own structure needs no bounded-mode support at all.** It's
+  written generically over the register size (`@guppy.comptime`,
+  `array[qubit, n]`); guppylang 1.0.2 fully unrolls its two `for` loops at
+  compile time, so the compiled algorithm is pure straight-line gates —
+  the `Conditional` nodes `upper_bound=True` had to bound came from
+  unrelated qubit-array-indexing machinery, not QFT's own loops.
+- **Two of qshelf's own idiomatic patterns currently fail**, both
+  demonstrated for real in `qft_n.py`, not just described: constructing
+  the qubit array with `array(qubit() for _ in range(n))` (a `TailLoop`,
+  unsupported) and freeing it with `discard_array(qs)` (a call to a
+  non-inlined function, `CallNotSupported` — see above). Both were found
+  *because* a real algorithm was tested, not a synthetic example.
+- **QFT itself stops being inlined at 4+ qubits**, which is exactly the
+  size range anyone would actually want a resource estimate for. Before
+  this stress test, that silently produced a near-zero, wrong gate count
+  with no error at all — the most serious finding here. `CallNotSupported`
+  now catches it, at the cost of not being able to estimate it yet.
+
+Actual output (`python examples/qft_n.py`, guppylang 1.0.2 / qualtran 0.7.0):
+
+```
+=== Working result: QFT on 3 qubits (literal array, individual discard) ===
+guppy-estimand result (scheme=beverland, code distance d=17)
+  *** UPPER BOUND -- NOT a point estimate (upper_bound=True) ***
+  logical qubits:    3
+  logical gates:     clifford: 6, rotation: 3
+  physical qubits:   5,770  (upper bound)
+  runtime:           5.610e-07 hours  (upper bound)
+  total error:       6.722e-04  (upper bound)
+  note: physical qubits include a local fix for a confirmed Qualtran bug (https://github.com/quantumlib/Qualtran/issues/1943); see CLAUDE.md.
+  note: total error is understated ~4.9x vs. the cited paper's own constant, unpatched (https://github.com/quantumlib/Qualtran/issues/1944); see CLAUDE.md.
+
+=== Documented finding 1: qshelf's own array(... for _ in range(n)) idiom ===
+UnsupportedControlFlowShape (expected): HUGR node Node(7) is a TailLoop, ...
+
+=== Documented finding 2: qshelf's own discard_array(qs) idiom ===
+CallNotSupported (expected): HUGR node Node(24) calls 'guppylang.std.quantum.discard_array$3' ...
+
+=== Documented finding 3: qft itself stops being inlined at n=4 ===
+CallNotSupported (expected): HUGR node Node(9) calls 'qft' ...
+```
+
+(gate counts hand-verified: 3 qubits → 3×H + 3×CRz from the rotation
+cascade + one 3-CNOT swap = 6 clifford, 3 rotation — matches exactly.)
+
 ## Project layout
 
 - `src/guppy_estimand/gate_counts.py` — HUGR walker: compiled guppy program → Qualtran `GateCounts`.
 - `src/guppy_estimand/estimate.py` — `GateCounts` → Qualtran `PhysicalCostModel` → `EstimateResult`.
-- `examples/` — runnable guppy programs with expected output.
+- `examples/` — runnable guppy programs with expected output, including
+  `qft_n.py` (real-world stress test, see above) and `_qshelf_qft.py` (the
+  minimal vendored source it depends on, from kkoci/Qshelf).
 - `tests/` — unit tests, including a hand-verified numeric example.

@@ -106,6 +106,31 @@ class UnsupportedControlFlowShape(NotImplementedError):
     """
 
 
+class CallNotSupported(NotImplementedError):
+    """Raised (in both straight-line and ``upper_bound`` mode) when the
+    HUGR contains an ``ops.Call`` node: a call to a function that was
+    compiled as a separate ``FuncDefn`` rather than inlined at the call
+    site.
+
+    Neither walker follows ``Call`` edges into the callee's own FuncDefn --
+    its gates are otherwise entirely invisible, which would silently
+    undercount (potentially down to zero) any real program that calls a
+    non-inlined helper function. This is not a hypothetical: verified by
+    hand against a real algorithm (qshelf's QFT, see CLAUDE.md "Real-world
+    stress test") that guppylang 1.0.2 inlines small generic-comptime
+    functions but compiles them as a separate, called FuncDefn once they
+    cross some size/complexity threshold -- e.g. `qft` was inlined for a
+    4-qubit register but NOT for 4+ qubits, with no other change to the
+    calling code. Before this was raised, `extract_gate_counts` silently
+    returned near-zero gate counts (only the caller's own directly-visible
+    ops) for the non-inlined case, with no indication anything was missing.
+
+    There is no supported workaround yet -- following ``Call`` edges into
+    arbitrary callees (with memoization, and handling for recursive calls)
+    is unimplemented. See CLAUDE.md "Possible future work".
+    """
+
+
 def _as_hugr(compiled: Package | Hugr) -> Hugr:
     if isinstance(compiled, Package):
         if len(compiled.modules) != 1:
@@ -114,6 +139,24 @@ def _as_hugr(compiled: Package | Hugr) -> Hugr:
             )
         return compiled.modules[0]
     return compiled
+
+
+def _call_target_name(hugr: Hugr, call_node) -> str:
+    """Best-effort resolution of an ``ops.Call`` node's target FuncDefn
+    name, for a more useful error message. Falls back to a generic
+    description if the target can't be resolved (defensive -- this is only
+    used to make `CallNotSupported`'s message more specific, never load-
+    bearing for correctness)."""
+    try:
+        last_port = hugr.num_in_ports(call_node) - 1
+        (target_out_port,) = hugr.linked_ports(call_node.inp(last_port))
+        target_node = target_out_port.node
+        target_op = hugr[target_node].op
+        if isinstance(target_op, ops.FuncDefn):
+            return f"{target_op.f_name!r} (HUGR node {target_node})"
+        return f"HUGR node {target_node}"
+    except Exception:
+        return "<unresolved>"
 
 
 def _classify_ext_op(node, name: str) -> tuple[GateCounts, int]:
@@ -157,6 +200,15 @@ def _extract_gate_counts_straight_line(hugr: Hugr) -> tuple[GateCounts, int]:
                 "Pass upper_bound=True to estimate()/extract_gate_counts() to "
                 "opt into worst-case bounding instead. See "
                 "CLAUDE.md 'Known limitations' / 'Bounded control flow (opt-in)'."
+            )
+
+        if isinstance(op, ops.Call):
+            raise CallNotSupported(
+                f"HUGR node {node} calls {_call_target_name(hugr, node)}, which "
+                "was compiled as a separate function rather than inlined. Its "
+                "gates are not counted -- see CallNotSupported's docstring and "
+                "CLAUDE.md 'Real-world stress test' for why this fails loudly "
+                "instead of silently under-counting."
             )
 
         if not isinstance(op, ops.ExtOp):
@@ -285,11 +337,22 @@ def _walk_region(hugr: Hugr, container: Node, loop_trip_counts: dict[int, int]) 
         elif isinstance(op, ops.TailLoop):
             raise UnsupportedControlFlowShape(
                 f"HUGR node {child} is a TailLoop, which upper_bound mode does "
-                "not support: guppylang 1.0.2 / hugr 0.18.5 were never observed "
-                "to produce this node for while/for loops (both compile to a "
-                "CFG with a back edge instead -- see CLAUDE.md 'HUGR quirks'). "
-                "This needs hand-verification against a real example before "
+                "not support. Note (2026-09-04): guppylang 1.0.2 / hugr 0.18.5 "
+                "were never observed to produce this node for plain while/for "
+                "STATEMENTS (both compile to a CFG with a back edge instead), "
+                "but real qshelf code showed it DOES appear for the "
+                "`array(x for _ in range(n))` array-COMPREHENSION idiom -- see "
+                "CLAUDE.md 'HUGR quirks' / 'Real-world stress test'. This still "
+                "needs hand-verification against a real TailLoop example before "
                 "adding support, not a guess."
+            )
+        elif isinstance(op, ops.Call):
+            raise CallNotSupported(
+                f"HUGR node {child} calls {_call_target_name(hugr, child)}, "
+                "which was compiled as a separate function rather than "
+                "inlined. Its gates are not counted -- see CallNotSupported's "
+                "docstring and CLAUDE.md 'Real-world stress test' for why this "
+                "fails loudly instead of silently under-counting."
             )
         elif isinstance(op, ops.ExtOp):
             name = op.name()
@@ -511,6 +574,10 @@ def extract_gate_counts(
             no entry in ``loop_trip_counts``.
         UnsupportedControlFlowShape: ``upper_bound=True`` and the CFG has a
             shape not hand-verified as boundable (see the class docstring).
+        CallNotSupported: the program calls a function that was compiled
+            separately rather than inlined -- its gates cannot currently be
+            seen or counted at all (see the class docstring; this is a real
+            gap found via a real-world stress test, not a hypothetical).
     """
     hugr = _as_hugr(compiled)
     if not upper_bound:

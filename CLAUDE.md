@@ -523,18 +523,194 @@ rather than silently guessing): `for` loops over an iterator (nested
 CFG + iterator-protocol machinery — see "HUGR quirks" above), a loop with
 more than one back edge into the same header, a loop header without
 exactly one "into the loop" and one "exit" successor, a loop body with an
-internal early exit (e.g. `break`), and `TailLoop` nodes (never observed
-produced by this guppylang/hugr version). Each of these would need its own
-hand-verification pass, per this project's correctness bar, before being
-supported — none has been done.
+internal early exit (e.g. `break`), and `TailLoop` nodes. **Update
+(2026-09-04): "never observed produced" for `TailLoop` no longer holds
+unconditionally** — a real qshelf program showed it IS produced, for the
+`array(x for _ in range(n))` array-comprehension idiom specifically (not
+for plain `while`/`for` statements, where the original claim still holds).
+See "Real-world stress test" below. Each of these unsupported shapes would
+still need its own hand-verification pass, per this project's correctness
+bar, before being supported — none has been done, including for the
+now-confirmed-real `TailLoop` case.
+
+Also **not supported, found via the same real-world stress test, and more
+serious than any of the above**: calling a function that was compiled as a
+separate, non-inlined `FuncDefn` (`CallNotSupported`, added 2026-09-04).
+See "Real-world stress test" below — this one was a genuine silent
+undercount before the fix, not just an unhandled shape refused loudly from
+the start.
+
+## Real-world stress test (2026-09-04): QFT from kkoci/Qshelf
+
+Everything above was built and verified against hand-written, synthetic
+examples. This section runs `guppy_estimand` against a real,
+independently-authored algorithm for the first time — [kkoci/Qshelf](https://github.com/kkoci/Qshelf)'s
+QFT implementation (`packages/qft`) — as a stress test of the whole
+pipeline, following the same "verify by hand, don't assume" discipline as
+everything else in this file. It found two real, previously-unknown gaps,
+which is exactly the kind of thing this exercise was for.
+
+**Step 0 — version check.** qshelf's every package pins `guppylang==1.0.2`
+(`packages/*/pyproject.toml`), exactly matching this project's installed
+version (see "Environment / versions actually used" above). No version
+mismatch to account for; tested directly against the installed toolchain.
+
+**Step 1 — confirming QFT is a reasonable first candidate.** Read
+`packages/qft/src/qft/qft.py` directly rather than assuming its shape from
+the package name. Found: `qft[n](qs: array[qubit, n])` is decorated
+`@guppy.comptime(daggerable=True)` and generic over the register size `n`,
+with two nested Python-level `for` loops (a rotation cascade: `for i in
+range(n): h(qs[i]); for j in range(i+1, n): crz(...)`) plus a final swap
+pass (`for k in range(n//2): swap(...)`). `iqft` (the inverse) exists in
+the same file but was NOT used, per the landmine noted in the task that
+motivated this exercise: Quantinuum/guppylang#2250, a real, documented,
+unrelated guppylang bug where `iqft` produces a wrong unitary compiled
+standalone vs. combined with `qft`. Only `swap` and `qft` were vendored
+into `examples/_qshelf_qft.py` (verbatim, with an attribution header).
+
+**Step 2 — the actual compiled HUGR structure (verified by hand, several
+surprises).** Compiled a `main()` calling `qft(qs)` on a small register and
+inspected the result directly (`hugr.nodes()`, `hugr.children()`,
+`hugr.output_neighbours()`, `hugr.descendants()` — same tools as every
+prior verification pass). Findings, in the order they were hit:
+
+1. **The idiomatic array construction, `array(qubit() for _ in range(N))`
+   (exactly what qshelf's own `examples/basic_qft.py` uses), compiles to a
+   `TailLoop` node.** This is the first time this project has ever
+   observed a real `TailLoop` — every prior verification (see "HUGR
+   quirks" above) found plain `while`/`for` *statements* compile to a CFG
+   with a back edge instead. The two are compiled differently: an
+   array-comprehension is lowered via `TailLoop`, an ordinary loop
+   statement is not. `guppy_estimand`'s bounded walker explicitly refuses
+   `TailLoop` (no verified handling exists for it), so this raises
+   `UnsupportedControlFlowShape` immediately — confirmed by actually
+   running it, not inferred from the node type alone.
+2. **Switching to a literal array construction, `array(qubit(), qubit(),
+   qubit())`, avoids the `TailLoop`** (confirmed: the node type histogram
+   for the compiled HUGR no longer contains `TailLoop` at all). What's left
+   is a `CFG` with a single back edge (matching the already-verified
+   while-loop-containing-a-conditional shape) plus several `Conditional`
+   nodes — all inside `guppylang.std.quantum.discard_array`'s own body, NOT
+   inside `qft` (see point 4). `qft`'s OWN contribution to `main`, at small
+   n, turned out to be **pure straight-line dataflow** — its two `for`
+   loops are fully unrolled at compile time by `@guppy.comptime`
+   specialization for a statically-known `n`. This means the bounded-mode
+   work (conditional upper bounds, loop trip counts, nested-loop handling)
+   was **not actually exercised by QFT's own algorithmic structure at
+   all** — a genuinely useful, if slightly deflating, finding: `upper_bound=True`
+   was needed here only because of *unrelated* array-handling machinery,
+   not because QFT itself has runtime-dependent control flow.
+3. **`collections.borrow_arr.*` ops (array-indexing/construction
+   bookkeeping for linear qubit arrays) are not `tket.*`-namespaced.** The
+   bounded walker's existing "skip any non-`tket.` ExtOp" rule (originally
+   justified only for classical loop-condition/iterator-protocol
+   bookkeeping — see "HUGR quirks" above) turned out to also cover these,
+   which was not something it was designed or verified for. It happens to
+   be safe (these ops are array bookkeeping, not physical operations), but
+   the straight-line walker has no equivalent allowance and raises
+   `UnrecognizedGate` on them — meaning **a genuinely straight-line guppy
+   program that uses `array[qubit, n]` indexing cannot currently be
+   estimated in default mode at all**, only in `upper_bound=True` mode
+   (which tolerates it only as a side effect of a rule meant for something
+   else). Not fixed in this pass; noted as a real gap below.
+4. **A real, serious bug: calls to non-inlined functions were silently
+   invisible.** `discard_array(qs)` (used by literally every qshelf
+   example/test to free a qubit array) turned out to compile as a call to
+   a *separately-compiled* `FuncDefn`, not inlined — confirmed via
+   `hugr.children()`/`f_name` lookups, and confirmed that
+   `Node(<that FuncDefn's id>) in hugr.descendants(hugr.entrypoint)` is
+   `False`: the callee's entire body, including a real `tket.quantum.QFree`,
+   is unreachable from `main`'s own subtree. Neither walker followed
+   `ops.Call` edges — a `Call` node was simply skipped (not `ops.ExtOp`,
+   not a recognized control-flow op, no branch handled it at all). For
+   `discard_array` specifically the numeric impact happened to be nil
+   (its only quantum op, `QFree`, is in `_IGNORED` and contributes 0
+   regardless) — but this was luck, not correctness.
+5. **The luck ran out at register size 4.** Swept `n = 2..6` (fresh
+   subprocess per `n`, checking `FuncDefn` names in the compiled HUGR
+   directly): `qft` itself is inlined into `main` for `n <= 3`, but
+   compiled as a **separate, called `FuncDefn`** for `n >= 4` — with zero
+   other code change, purely a function of the register size crossing some
+   compiler-internal inlining threshold. Before any fix, calling
+   `extract_gate_counts(upper_bound=True, ...)` on the `n=4` program
+   **silently returned `GateCounts()` (all zero) plus only the 4 directly-
+   visible `QAlloc`s** — i.e., it reported that QFT does *nothing*, with
+   no exception, no warning. This was only caught because of this
+   project's own stated discipline: sanity-checking the walker's output
+   against a hand-derived expectation (4 qubits → 4×H + 6×CRz from the
+   cascade + 2 swaps × 3 CX = 10 clifford, 6 rotation) caught the
+   all-zero result as implausible immediately. **This is the single most
+   serious finding of this stress test**: a real, natural, idiomatic
+   real-world program at a realistic size (4+ qubits — nobody estimates a
+   3-qubit QFT for its own sake) produced a confidently-wrong,
+   plausible-looking number with zero indication anything was missing.
+
+**Fix applied (2026-09-04): `CallNotSupported`.** Rather than leave this as
+a silent gap (or, at the other extreme, attempt the much larger undertaking
+of actually following `Call` edges into arbitrary callees — memoization
+across FuncDefn boundaries, handling potential recursion — which is out of
+scope for what this stress-test task asked for), both walkers now detect
+`ops.Call` directly and raise a new exception, `CallNotSupported`, naming
+the unreachable callee by resolving the `Call` node's static function-
+pointer edge (`hugr.num_in_ports`/`linked_ports` on the last input port) to
+the target `FuncDefn` and reading its `f_name`. This converts the silent
+wrong-number failure mode into a loud, honest one — consistent with this
+project's existing `ControlFlowNotSupported`/`UnrecognizedGate`/
+`UnsupportedControlFlowShape` pattern of refusing to guess rather than
+guessing wrong. It does **not** make QFT-at-4-qubits (or any call to a
+non-inlined function) estimable — that's real future work, tracked below.
+Regression tests: `tests/test_call_not_supported.py` (a minimal
+`discard_array`-based repro, chosen because plain user-defined helper
+functions were found to reliably get inlined at the sizes tried, while
+`discard_array` reliably does not — so it's the smallest available reliable
+trigger for the bug this guards).
+
+**Step 3/4 — the actual reported result.** Working around both idioms
+(literal array construction instead of the comprehension; individual
+`discard()` per qubit instead of `discard_array`) keeps `n` at 3 (the last
+size where `qft` is still inlined) and gives a fully working, hand-verified
+result: `gate_counts = GateCounts(clifford=6, rotation=3)`, `n_qubits = 3`
+— matching the hand-derived expectation (3×H + 3×CRz + one 3-CNOT swap)
+exactly. Full `estimate()` output, and the three documented failure modes
+run for real (not just described), are in `examples/qft_n.py` and
+README.md "Real-world stress test".
+
+**Honest bottom line**: QFT's own algorithmic structure is fine and needs
+no bounded-mode support at all once compiled. What this stress test
+actually found is two real gaps in `guppy_estimand` — a `TailLoop` shape
+and, much more seriously, an entire class of silent undercount from
+un-followed function calls — that no synthetic test had ever exposed,
+because every synthetic test so far was a single self-contained function.
+That is the primary, most valuable result of this exercise, not the
+6-clifford/3-rotation number.
 
 ## Possible future work (not started)
 
 - ~~Support straight-line-with-known-bounds control flow...~~ **Done,
   2026-09-02 — see "Bounded control flow (opt-in)" above.** Remaining gaps
   within that feature (not "future work" so much as known scope limits):
-  `for`-loop/iterator support, loops with internal `break`, `TailLoop`
-  support if it's ever actually observed produced.
+  `for`-loop/iterator support, loops with internal `break`, full `TailLoop`
+  support (now confirmed reachable in practice, via array comprehensions —
+  see "Real-world stress test" above; still unimplemented).
+- **Follow `ops.Call` edges into non-inlined callees** (found 2026-09-04,
+  see "Real-world stress test" above). Currently `CallNotSupported` fails
+  loudly instead of silently under-counting, which is the right interim
+  behavior, but it blocks estimating essentially any real guppy program
+  that calls a helper function not small/simple enough to be inlined —
+  including, concretely, any qshelf algorithm at a realistic qubit count.
+  Needs: recursing into the callee's own `FuncDefn` subtree with the same
+  walker, memoization keyed by FuncDefn (a function called from multiple
+  sites shouldn't be re-walked each time), and a decision on what to do
+  about recursive calls (a trip-count-like mechanism, analogous to loops,
+  is the likely shape of a solution, but hasn't been designed). This is
+  now the highest-priority item on this list — found via real code, not
+  hypothetical.
+- Extend non-`tket.*`-ExtOp tolerance (currently bounded-mode-only, and
+  only as a side effect of a rule designed for something else — see "Real-
+  world stress test" point 3 above) to the straight-line walker too, so
+  straight-line programs using `array[qubit, n]` indexing don't
+  unnecessarily raise `UnrecognizedGate` on `collections.borrow_arr.*`
+  bookkeeping ops.
 - Auto-select `data_d` for a target total error budget (bisection over
   Qualtran's `model.error()`).
 - `hugr-qir`-based cross-check: independently estimate from the QIR output

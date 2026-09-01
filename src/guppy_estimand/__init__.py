@@ -1,5 +1,6 @@
 from guppy_estimand.estimate import EstimateResult, estimate
 from guppy_estimand.gate_counts import (
+    CallNotSupported,
     ControlFlowNotSupported,
     LoopTripCountMissing,
     UnrecognizedGate,
@@ -15,4 +16,5 @@ __all__ = [
     "UnrecognizedGate",
     "LoopTripCountMissing",
     "UnsupportedControlFlowShape",
+    "CallNotSupported",
 ]
