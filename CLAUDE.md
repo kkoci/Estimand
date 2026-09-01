@@ -340,13 +340,14 @@ optimizer's effect on repeated gates):**
     conditional branches), and the tool tells the caller the exact ID to
     use via `LoopTripCountMissing`'s error message, so opacity of raw node
     IDs isn't a practical usability problem.
-  - `ops.TailLoop` is kept as an explicit, deliberately-unsupported case
-    (`UnsupportedControlFlowShape`) in the bounded walker rather than given
-    speculative handling — since no real example was ever observed, any
-    handling written for it would be a guess, which this project's
-    correctness bar doesn't allow. If a real `TailLoop` ever shows up
-    (a different guppylang version, or hand-constructed HUGR), it needs
-    its own hand-verification pass before being supported.
+  - `ops.TailLoop` was, at the time this note was written, kept as an
+    explicit, deliberately-unsupported case rather than given speculative
+    handling, since no real example had been observed. **Update
+    (2026-09-06): a real example WAS since found (the array-comprehension
+    idiom, see "Real-world stress test" / "TailLoop support" below), and
+    is now supported for that one verified shape** — the reasoning above
+    (don't guess at an unobserved shape) still applies to any `TailLoop`
+    that doesn't match it.
 - **`compile()` applies an optimization pass by default
   (`OptimizationLevel.Default`) that cancels repeated identical adjacent
   gates.** Verified directly: `x(q0); x(q0); x(q0)` compiles down to a
@@ -523,26 +524,37 @@ rather than silently guessing): `for` loops over an iterator (nested
 CFG + iterator-protocol machinery — see "HUGR quirks" above), a loop with
 more than one back edge into the same header, a loop header without
 exactly one "into the loop" and one "exit" successor, a loop body with an
-internal early exit (e.g. `break`), and `TailLoop` nodes. **Update
-(2026-09-04): "never observed produced" for `TailLoop` no longer holds
-unconditionally** — a real qshelf program showed it IS produced, for the
-`array(x for _ in range(n))` array-comprehension idiom specifically (not
-for plain `while`/`for` statements, where the original claim still holds).
-See "Real-world stress test" below. Each of these unsupported shapes would
+internal early exit (e.g. `break`). Each of these unsupported shapes would
 still need its own hand-verification pass, per this project's correctness
-bar, before being supported — none has been done, including for the
-now-confirmed-real `TailLoop` case.
+bar, before being supported — none has been done.
+
+**Update (2026-09-04): "never observed produced" for `TailLoop` no longer
+holds unconditionally** — a real qshelf program showed it IS produced, for
+the `array(x for _ in range(n))` array-comprehension idiom specifically
+(not for plain `while`/`for` statements, where the original claim still
+holds). See "Real-world stress test" below.
+
+**Update (2026-09-06): `TailLoop` is now supported, for one verified
+shape** — see "TailLoop support" below for the full derivation (how the
+shape was identified, why trip-count auto-derivation was investigated and
+not implemented, and why `n_qubits` scales with trip count here unlike
+CFG while-loops). A `TailLoop` with a different internal structure still
+raises `UnsupportedControlFlowShape`, same as any other unverified shape
+on this list.
 
 **Update (2026-09-05): calling a non-inlined function is no longer in this
 "not supported" list.** It was, briefly (`CallNotSupported`, added
 2026-09-04, after the same real-world stress test found it as a genuine
 silent undercount — the most serious finding of that pass, more serious
-than the `TailLoop` case above). It is now followed and walked instead —
-see "Call-following" below for the fix, the trip-count composition design
-across call boundaries, and the qshelf re-run. `CallNotSupported` still
-exists, narrowed to the genuinely irresolvable case (`CallIndirect`, or a
-`Call` targeting a `FuncDecl`); a new exception,
-`RecursiveCallNotSupported`, covers a cyclic call graph.
+than the `TailLoop` case above was at the time). It is now followed and
+walked instead — see "Call-following" below for the fix, the trip-count
+composition design across call boundaries, and the qshelf re-run.
+`CallNotSupported` still exists, narrowed to the genuinely irresolvable
+case (`CallIndirect`, or a `Call` targeting a `FuncDecl`); a new exception,
+`RecursiveCallNotSupported`, covers a cyclic call graph. **Update
+(2026-09-06): `CallIndirect` is confirmed reachable from real code, not
+just a defensive/untested case** — see "TailLoop support" below, the
+Grover investigation.
 
 ## Real-world stress test (2026-09-04): QFT from kkoci/Qshelf
 
@@ -880,33 +892,230 @@ Full `estimate()` output (physical qubits/runtime/error, scheme=beverland,
 and README.md "Real-world stress test" — physical qubit count and runtime/
 error all scale monotonically with `n`, as expected.
 
-**Honest bottom line, updated**: call-following resolved the single most
-serious finding from the first stress-test pass — QFT is now estimable at
-every register size tested, using qshelf's own real, idiomatic
-`discard_array` pattern, not a workaround. The array-comprehension
-`TailLoop` gap from the first pass remains genuinely open (a different
-problem this task was not asked to fix); `examples/qft_n.py` demonstrates
-it still failing, for real, rather than silently dropping it from the
-example now that the headline result looks better.
+**Honest bottom line, updated 2026-09-06**: call-following resolved the
+first pass's most serious finding — QFT is estimable at every register
+size tested, using qshelf's own real, idiomatic `discard_array` pattern.
+The array-comprehension `TailLoop` gap this pass left open is now ALSO
+resolved — see "TailLoop support" below — so `examples/qft_n.py` runs
+qshelf's `qft` completely unmodified, zero workarounds, across `n=2..6`.
+
+## TailLoop support (2026-09-06)
+
+Resolves the `TailLoop` gap left open by the real-world stress test above:
+`array(qubit() for _ in range(n))` — qshelf's standard idiom for
+allocating a qubit register, used in every package, not just QFT — is now
+walked instead of unconditionally refused. Same discipline as every prior
+pass: HUGR structure verified by hand before any code was written.
+
+**Step 1 — the actual `TailLoop` structure, verified by hand, several
+real surprises.** Compiled `array(qubit() for _ in range(3))` (via
+`discard_array`, since a bare comprehension can't be consumed directly)
+and inspected the result directly (`hugr.children`, `hugr.linked_ports`,
+plus `inspect.getsource(ops.TailLoop)` / `ops.Tag` / `ops.Case` on the
+installed hugr 0.18.5 package — not assumed from the general HUGR spec).
+Findings, in the order they were hit:
+
+1. **`ops.TailLoop` itself confirmed to carry NO iteration-count field at
+   all** — its only data is `just_inputs`/`rest`/`just_outputs`
+   (`tys.TypeRow`s). Standard HUGR semantics apply exactly as specified:
+   the body computes `Sum([just_inputs, just_outputs])` each invocation;
+   variant 0 ("Left") continues with new `just_inputs`-typed state,
+   variant 1 ("Right") breaks with a `just_outputs`-typed result. This
+   directly answers step 1's first question: there is no shortcut op-level
+   field to read a trip count from, confirmed by reading the class, not
+   assumed.
+2. **The TailLoop's direct children are NOT simply "a loop body" in any
+   flat sense** — for the comprehension idiom, they are: `Input`,
+   `Output`, `UnpackTuple`, `MakeTuple`, exactly one `Conditional` (2
+   `Case`s), a nested `CFG` (!), and two trailing `Const`s feeding the
+   initial state. The nested `CFG` computes the continue/break decision
+   (comparing a running counter against the range bound) and its single
+   output wires DIRECTLY into the `Conditional`'s selector port — verified
+   via `hugr.linked_ports`, not inferred from adjacency. The `Conditional`
+   itself is the LAST computation in the body: its outputs wire directly
+   into the `TailLoop`'s own `Output` node, also verified via
+   `linked_ports`, not assumed. Whatever else the body contains (here, the
+   nested `CFG`) needed NO special handling at all: it's walked as
+   ordinary "shared, runs-every-invocation" content via the same
+   `_walk_child` dispatch already used everywhere else — a `CFG` is a
+   `CFG` regardless of what contains it.
+3. **Case POSITION does not match Sum-variant order — verified, and this
+   would have been a real bug if assumed instead of checked.** For the
+   observed example, `hugr.children(conditional)` returned `[Case_A,
+   Case_B]` where `Case_A` (position 0) was actually the BREAK case
+   (Sum tag 1) and `Case_B` (position 1) was CONTINUE (tag 0) — the
+   opposite of naively assuming "position i = variant i". Each Case's
+   role was instead determined by tracing its `Output` node's port-0
+   source back to whatever produces the Sum value: a live `ops.Tag` node
+   (read `.tag` directly, confirmed via `inspect.getsource(ops.Tag)` —
+   `tag: int` is a real field), OR — for a no-payload variant the
+   compiler constant-folds away (e.g. `Right()` with an empty
+   `just_outputs`, which appeared as `ops.Const` holding a
+   `hugr.val.Sum` value reached via `ops.LoadConst`, with NO live `Tag`
+   op at all) — the `Const`'s `.val.tag` (confirmed: `hugr.val.Sum`
+   exposes `.tag`/`.n_variants` directly). Checking only for a live `Tag`
+   op would have silently missed this second, equally-real pattern.
+4. **Trip-count auto-derivation: investigated concretely, not just
+   assumed impossible, and found genuinely not safely tractable in one
+   pass.** The range bound (`3` for `range(3)`) IS present in the HUGR as
+   a literal `Const` node when `n` is compile-time-known — confirmed by
+   finding it. But robustly identifying WHICH of several `Const` nodes
+   represents "the true iteration bound" (as opposed to the array size
+   used by unrelated `collections.borrow_arr.*` bounds-checking, the
+   range step, or other incidental constants scattered through the
+   tuple-packed loop state and the nested `CFG`'s own comparison logic)
+   would require interpreting the specific compiled arithmetic pattern —
+   a form of abstract interpretation over the loop-condition subgraph, not
+   reading one structurally-guaranteed field the way `ops.Call`'s function
+   pointer port was (see "Call-following" above for that contrast). This
+   is exactly the kind of "more design work than fits in one pass" this
+   project's correctness bar treats as a valid, honest stopping point
+   rather than a fragile guess dressed up as a feature. **Decision: every
+   `TailLoop` requires an explicit caller-supplied trip count**, using the
+   exact same `loop_trip_counts` dict as CFG loops, keyed by the
+   `TailLoop` node's own ID (there's no separate "header block" concept
+   the way a CFG loop has one).
+
+**Step 2/3 — implementation, reusing existing machinery.** `_walk_child`
+(a new shared per-node-type dispatcher, factored out of `_walk_region`'s
+loop body so `_walk_region` and the new TailLoop handling share it rather
+than duplicating the CFG/Conditional/Call/ExtOp dispatch) now routes
+`ops.TailLoop` to `_walk_tail_loop`, which: identifies the decision
+`Conditional` and validates the shape from step 1 (raising
+`UnsupportedControlFlowShape`, not guessing, for anything that doesn't
+match — no different in spirit from the existing CFG-shape checks);
+computes `shared_cost` by walking every OTHER direct child via the same
+`_walk_child` dispatch; determines each Case's role via `_case_output_tag`
+(the Tag-or-Const-tag tracing from step 1, point 3); walks each Case's
+body via the existing `_walk_region`; and combines via
+`shared*(trip+1) + continue*trip + break*1` — directly reusing
+`_RegionCost`, `_get_trip_count`, and a generalization of the existing
+`_scale_gates_only` pattern (see step 4 below for why a NEW
+`_scale_including_qubits` was needed instead of reusing that function
+as-is). This is a small, targeted addition on top of existing primitives,
+not a parallel implementation — the only genuinely new logic is the
+shared/continue/break decomposition and the Case-tag tracing, both
+specific to what a `TailLoop`'s body actually looks like.
+
+**Step 4 — a real, verified semantic difference from CFG while-loops:
+`n_qubits` scales with trip count here.** The existing CFG-loop
+convention (`_scale_gates_only`, `n_qubits` NOT scaled) is justified by
+guppy's linear typing forcing a while-loop-local qubit to be freed within
+the same iteration. That justification does **not** hold for the
+array-comprehension idiom: each iteration's `qubit()` call becomes part of
+the loop-carried state (the growing array) and survives into the NEXT
+iteration and beyond the loop entirely — it is never freed per-iteration.
+Applying the CFG-loop convention here would silently undercount, breaking
+the upper-bound guarantee (an upper bound must never undercount; it may
+only ever be looser than necessary). `_scale_including_qubits` (new)
+scales both dimensions; used for all three of `TailLoop`'s
+shared/continue/break components.
+
+**Verified this doesn't conflict with the existing CFG-loop convention
+when nested — by actually running the composition, not just reasoning
+about it.** A `TailLoop`-built 3-qubit array constructed fresh inside a
+caller `while` loop (trip count 2), immediately freed via `discard_array`
+before each outer iteration ends, was checked to give `n_qubits == 3`,
+**not** `6` (`outer_trip * tailloop_trip`) — a wrong first guess this
+project's own test caught before it became a false claim in this file.
+The reason both conventions coexist correctly: the `TailLoop`'s OWN
+internal scaling (×3, for one full pass constructing the array) is real
+and reflects 3 qubits genuinely coexisting; the OUTER while-loop's
+existing non-scaling is ALSO still correct, because guppy's linear typing
+forces that same array to be fully consumed before the outer loop can
+repeat, so the outer repetitions reuse the same physical slots — exactly
+the original while-loop justification, just now demonstrated to compose
+correctly with a structurally different inner loop shape rather than
+merely asserted to. See
+`tests/test_tail_loop.py::test_tail_loop_inside_while_loop`. A second
+composition test (`::test_tail_loop_inside_conditional`) checks a
+`TailLoop`-branch against a literal-array branch inside one `if`/`else`,
+confirming both `clifford` and `n_qubits` independently take the max of
+their own branch, as expected.
+
+**Step 5 — re-running the qshelf stress test, full honest result.**
+Re-ran QFT (`packages/qft`) across `n=2..6` using qshelf's **completely
+unmodified** source — the real `array(qubit() for _ in range(n))`
+construction and the real `discard_array(qs)` call, no workarounds
+anywhere. **All five sizes succeed and match the exact same closed-form
+formula verified in the call-following pass** (`clifford = n + 3⌊n/2⌋`,
+`rotation = n(n-1)/2`) — identical numeric output to the literal-array
+workaround from that pass, confirming the fix doesn't just "not crash" but
+computes the same, already-hand-verified-correct answer.
+
+**Also checked, as the task asked ("if time permits"): `packages/grover`.**
+Two things worth reporting honestly here, neither of which was assumed
+going in:
+
+- **The premise that Grover "needs a genuinely runtime-dependent trip
+  count" does not hold — checked directly, not taken on faith.**
+  `grover_search[marked: nat, iterations: nat]` takes `iterations` as a
+  compile-time `nat` *generic parameter*, exactly like QFT's register size
+  `n` — `examples/basic_grover.py` calls
+  `grover_search[MARKED, ITERATIONS](qs)` with both values computed in
+  plain Python before compilation. There is no genuinely runtime-dependent
+  loop-trip-count case in this qshelf package after all; this task's
+  auto-derive/manual-count design (§ step 4 above) was not actually
+  stress-tested against the scenario it was expected to be.
+- **Grover currently cannot be estimated at all — but for an entirely
+  different, unrelated reason, found along the way rather than fixed.**
+  Compiling qshelf's own `basic_grover.py` example and walking it hits
+  `CallNotSupported` on a `CallIndirect` node inside `main` itself, before
+  ever reaching `grover_search`'s own body. Root cause, confirmed by
+  inspecting the compiled HUGR's node-type histogram
+  (`CallIndirect: 4`, `LoadFunc: 4`): Grover's `with control(q0, q1):
+  x(q2)` modifier (documented in qshelf's own `grover.py` as a deliberate
+  workaround for a separate, unrelated guppylang bug where a *direct*
+  multi-controlled `z` gives a wrong unitary) compiles to a `LoadFunc` +
+  `CallIndirect` pair — a call through a loaded function *value*, not a
+  static edge to a known `FuncDefn`. This is exactly the case
+  `CallNotSupported`'s docstring already named as one of the two
+  remaining narrow cases (see "Call-following" above) — **previously
+  believed to be untested/hypothetical (no known guppy source pattern
+  produced it), now confirmed as a real, reachable case from real code.**
+  Not fixed in this pass (a materially different, new problem from
+  `TailLoop` support — resolving `CallIndirect` would mean statically
+  resolving what value flows through `LoadFunc` when possible, which is
+  its own investigation); tracked as a new item in "Possible future work"
+  below.
+
+**Honest bottom line**: `TailLoop` support, once the actual shape was
+understood (steps 1–2), turned out to compose cleanly with all existing
+machinery (steps 2–4) and fully resolves QFT end-to-end with zero
+workarounds (step 5) — a genuine, complete win for the task as scoped.
+The Grover check (also asked for, done honestly rather than skipped or
+faked) delivered a different kind of value: it corrected a wrong premise
+(Grover's trip count is not runtime-dependent) and surfaced a real,
+previously-unconfirmed gap (`CallIndirect`) that this pass did not set out
+to fix and did not force a fit for.
 
 ## Possible future work (not started)
 
 - ~~Support straight-line-with-known-bounds control flow...~~ **Done,
   2026-09-02 — see "Bounded control flow (opt-in)" above.** Remaining gaps
   within that feature (not "future work" so much as known scope limits):
-  `for`-loop/iterator support, loops with internal `break`, full `TailLoop`
-  support (now confirmed reachable in practice, via array comprehensions —
-  see "Real-world stress test" above; still unimplemented).
+  `for`-loop/iterator support, loops with internal `break`.
 - ~~Follow `ops.Call` edges into non-inlined callees~~ **Done, 2026-09-05 —
-  see "Call-following" below.** `CallNotSupported` is narrowed to
+  see "Call-following" above.** `CallNotSupported` is narrowed to
   genuinely irresolvable calls (`CallIndirect`, or a `Call` targeting a
   `FuncDecl`); an ordinary call to a defined function is now followed and
   walked, with recursion detected and refused as
-  `RecursiveCallNotSupported`. Re-running the qshelf QFT stress test with
-  this in place now succeeds across the full `n=2..6` range tested, using
-  the real, idiomatic `discard_array(qs)` call — see "Real-world stress
-  test" for the original finding and "Call-following" for the fix and
-  re-run.
+  `RecursiveCallNotSupported`.
+- ~~Full `TailLoop` support~~ **Done, 2026-09-06 — see "TailLoop support"
+  above.** The one verified shape (array-comprehension idiom) is walked;
+  a differently-shaped `TailLoop` still raises `UnsupportedControlFlowShape`.
+- **Resolve `CallIndirect` (found 2026-09-06, see "TailLoop support" above,
+  the Grover investigation).** Confirmed reachable from real code — the
+  `with control(...): x(...)` modifier used throughout qshelf's Grover
+  package compiles to a `LoadFunc` + `CallIndirect` pair, which
+  `CallNotSupported` currently refuses outright. Would need: statically
+  resolving what value flows into a `CallIndirect`'s target port when
+  possible (e.g. tracing a `LoadFunc` back to a known `FuncDefn`, which may
+  be tractable for the specific `control(...)`-modifier pattern even if
+  not for a genuinely dynamic function value) and falling back to
+  `CallNotSupported` (unchanged) only when that's not resolvable. Blocks
+  estimating Grover (and likely anything else using the `control(...)`
+  modifier) entirely today.
 - Extend non-`tket.*`-ExtOp tolerance (currently bounded-mode-only, and
   only as a side effect of a rule designed for something else — see "Real-
   world stress test" point 3 above) to the straight-line walker too, so

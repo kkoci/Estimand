@@ -95,14 +95,23 @@ class LoopTripCountMissing(NotImplementedError):
 
 
 class UnsupportedControlFlowShape(NotImplementedError):
-    """Raised in ``upper_bound`` mode when a CFG has a shape this project
-    has not hand-verified how to bound correctly: a loop with more than one
-    back edge into the same header, a header with other than exactly one
-    "into the loop" and one "exit" successor, a loop body with an internal
-    early exit (e.g. ``break``), a CFG with more than one entry block, or a
-    ``TailLoop`` node (never observed produced by guppylang 1.0.2/hugr
-    0.18.5 for ``while``/``for`` -- both compile to a CFG with a back edge
-    instead). Raised rather than silently computing a possibly-wrong bound.
+    """Raised in ``upper_bound`` mode when a CFG or TailLoop has a shape
+    this project has not hand-verified how to bound correctly.
+
+    For CFGs: a loop with more than one back edge into the same header, a
+    header with other than exactly one "into the loop" and one "exit"
+    successor, a loop body with an internal early exit (e.g. ``break``), or
+    a CFG with more than one entry block.
+
+    For ``TailLoop`` (added 2026-09-06, see CLAUDE.md "HUGR quirks" /
+    "TailLoop support" -- ``while``/``for`` *statements* still never
+    compile to this; only the ``array(x for _ in range(n))`` array-
+    comprehension idiom does): anything other than the one verified shape
+    -- exactly one ``Conditional`` child (with exactly 2 ``Case``s, one
+    producing Sum tag 0/continue, one producing tag 1/break) whose output
+    feeds the ``TailLoop``'s own ``Output`` directly. A different shape
+    (e.g. a loop body that doesn't reduce to this decision-Conditional
+    pattern, or an early exit) is refused rather than guessed.
     """
 
 
@@ -282,8 +291,23 @@ def _reduce_max_region_cost(costs: list[_RegionCost]) -> _RegionCost:
 
 def _scale_gates_only(cost: _RegionCost, n: int) -> _RegionCost:
     """Multiplies gate counts by a loop trip count, but NOT n_qubits. See
-    the "Bounded" section comment below for why."""
+    the "Bounded" section comment below for why. Used for CFG-back-edge
+    loops (``while``/``for`` statements) -- NOT for ``TailLoop`` (see
+    ``_scale_including_qubits`` and "TailLoop support" below, where this
+    assumption does not hold)."""
     return _RegionCost(cost.gates * n, cost.n_qubits)
+
+
+def _scale_including_qubits(cost: _RegionCost, n: int) -> _RegionCost:
+    """Multiplies BOTH gate counts and n_qubits by n. Used for TailLoop
+    (see "TailLoop support" below): unlike a CFG while-loop body, a qubit
+    allocated in a TailLoop's continue-Case (e.g. the array-comprehension
+    idiom's `qubit()` call) becomes part of the loop-carried state and
+    survives past that iteration -- it is not freed within the iteration
+    the way guppy's linear typing forces a while-loop-local qubit to be.
+    Not scaling n_qubits here would silently undercount, breaking the
+    upper-bound guarantee; scaling it is the conservative, correct choice."""
+    return _RegionCost(cost.gates * n, cost.n_qubits * n)
 
 
 @dataclass(frozen=True)
@@ -465,51 +489,51 @@ def _get_trip_count(header: Node, loop_trip_counts: dict[int, int]) -> int:
     return trip_count
 
 
+def _walk_child(hugr: Hugr, child: Node, ctx: _WalkCtx) -> _RegionCost:
+    """Dispatches on one node's op type and returns its cost contribution.
+    Shared by ``_walk_region``'s loop and ``_walk_tail_loop``'s "everything
+    except the decision Conditional" pass (see "TailLoop support" below),
+    so both use the same recursion into CFG/Conditional/TailLoop/Call
+    rather than duplicating it. Non-tket ExtOps (e.g. `arithmetic.int.*`,
+    `prelude.panic` -- classical loop-condition and iterator-protocol
+    bookkeeping, only ever encountered here, never in straight-line code)
+    are skipped: they are not quantum gates, so they have no GateCounts
+    bucket to raise UnrecognizedGate about."""
+    op = hugr[child].op
+
+    if isinstance(op, ops.CFG):
+        return _walk_cfg(hugr, child, ctx)
+    if isinstance(op, ops.Conditional):
+        return _walk_conditional(hugr, child, ctx)
+    if isinstance(op, ops.TailLoop):
+        return _walk_tail_loop(hugr, child, ctx)
+    if isinstance(op, ops.CallIndirect):
+        raise CallNotSupported(
+            f"HUGR node {child} is a CallIndirect: its target is a "
+            "runtime dataflow value, not a fixed function, so there is "
+            "no single body to walk."
+        )
+    if isinstance(op, ops.Call):
+        return _walk_call(hugr, child, ctx, _walk_region)
+    if isinstance(op, ops.ExtOp):
+        name = op.name()
+        if not name.startswith("tket."):
+            return _ZERO_COST  # classical control/arithmetic bookkeeping, not a gate
+        gates_delta, qubits_delta = _classify_ext_op(child, name)
+        return _RegionCost(gates_delta, qubits_delta)
+    # Input/Output/Const/LoadConst/MakeTuple/UnpackTuple/Tag/etc. carry no
+    # gates of their own and have no further quantum-relevant descendants
+    # in any structure verified so far.
+    return _ZERO_COST
+
+
 def _walk_region(hugr: Hugr, container: Node, ctx: _WalkCtx) -> _RegionCost:
     """Walks the direct children of a dataflow container node (a FuncDefn,
-    DataflowBlock, or Case body), accumulating gate counts. Recurses
-    specially into any CFG/Conditional/TailLoop/Call child. Non-tket ExtOps
-    (e.g. `arithmetic.int.*`, `prelude.panic` -- classical loop-condition
-    and iterator-protocol bookkeeping, only ever encountered here, never in
-    straight-line code) are skipped: they are not quantum gates, so they
-    have no GateCounts bucket to raise UnrecognizedGate about."""
+    DataflowBlock, or Case body), accumulating gate counts via
+    ``_walk_child``."""
     cost = _ZERO_COST
     for child in hugr.children(container):
-        op = hugr[child].op
-
-        if isinstance(op, ops.CFG):
-            cost = cost + _walk_cfg(hugr, child, ctx)
-        elif isinstance(op, ops.Conditional):
-            cost = cost + _walk_conditional(hugr, child, ctx)
-        elif isinstance(op, ops.TailLoop):
-            raise UnsupportedControlFlowShape(
-                f"HUGR node {child} is a TailLoop, which upper_bound mode does "
-                "not support. Note (2026-09-04): guppylang 1.0.2 / hugr 0.18.5 "
-                "were never observed to produce this node for plain while/for "
-                "STATEMENTS (both compile to a CFG with a back edge instead), "
-                "but real qshelf code showed it DOES appear for the "
-                "`array(x for _ in range(n))` array-COMPREHENSION idiom -- see "
-                "CLAUDE.md 'HUGR quirks' / 'Real-world stress test'. This still "
-                "needs hand-verification against a real TailLoop example before "
-                "adding support, not a guess."
-            )
-        elif isinstance(op, ops.CallIndirect):
-            raise CallNotSupported(
-                f"HUGR node {child} is a CallIndirect: its target is a "
-                "runtime dataflow value, not a fixed function, so there is "
-                "no single body to walk."
-            )
-        elif isinstance(op, ops.Call):
-            cost = cost + _walk_call(hugr, child, ctx, _walk_region)
-        elif isinstance(op, ops.ExtOp):
-            name = op.name()
-            if not name.startswith("tket."):
-                continue  # classical control/arithmetic bookkeeping, not a gate
-            gates_delta, qubits_delta = _classify_ext_op(child, name)
-            cost = cost + _RegionCost(gates_delta, qubits_delta)
-        # Input/Output/Const/LoadConst/MakeTuple/UnpackTuple/Tag/etc. carry
-        # no gates of their own and have no further quantum-relevant
-        # descendants in any structure verified so far.
+        cost = cost + _walk_child(hugr, child, ctx)
     return cost
 
 
@@ -517,6 +541,179 @@ def _walk_conditional(hugr: Hugr, cond_node: Node, ctx: _WalkCtx) -> _RegionCost
     """A Conditional's children are all Case nodes -- exactly one runs."""
     case_costs = [_walk_region(hugr, case, ctx) for case in hugr.children(cond_node)]
     return _reduce_max_region_cost(case_costs)
+
+
+# --- TailLoop support (added 2026-09-06) ---
+#
+# See CLAUDE.md "HUGR quirks" / "TailLoop support" for the full
+# hand-verified derivation. Short version: `array(qubit() for _ in
+# range(n))` -- the idiomatic qshelf pattern for allocating a qubit
+# register, used across every qshelf package, not just QFT -- compiles to
+# a real `ops.TailLoop` node (confirmed via `inspect.getsource` and a
+# compiled example, not assumed). Its structure, verified by hand against
+# the installed hugr 0.18.5 `ops.TailLoop`/`ops.Tag` classes:
+#
+#   - `TailLoop.just_inputs`/`.rest`/`.just_outputs` (all `tys.TypeRow`,
+#     no iteration-count field of any kind) confirm the HUGR spec's
+#     standard semantics: the body computes `Sum([just_inputs,
+#     just_outputs])` each invocation -- variant 0 ("Left") continues with
+#     new `just_inputs`-typed state, variant 1 ("Right") breaks with a
+#     `just_outputs`-typed result. There is NO op-level field exposing an
+#     iteration count -- confirmed by reading the class, not assumed.
+#   - For the one shape observed: the TailLoop's direct children include
+#     exactly one `ops.Conditional` (with exactly 2 `ops.Case`s) whose
+#     output feeds the TailLoop's own `Output` node directly -- confirmed
+#     via `hugr.linked_ports`, not inferred from node adjacency. Whatever
+#     ELSE the TailLoop's body contains (in the observed case, a nested
+#     `CFG` computing the continue/break decision from a running counter
+#     compared against the range bound) is walked as ordinary "shared,
+#     runs-every-invocation" content via the existing `_walk_child`
+#     dispatch -- no TailLoop-specific handling was needed for it, since a
+#     `CFG` is a `CFG` regardless of what contains it.
+#   - Determining WHICH Case is continue (tag 0) vs break (tag 1) is NOT
+#     reliable by Case position (verified: in the observed example, Case
+#     position 0 was actually the BREAK case, position 1 was continue --
+#     the opposite of naively assuming "position i = variant i"). Instead,
+#     each Case's Output is traced back to whatever produces its Sum-typed
+#     value: either a live `ops.Tag` node (read `.tag` directly), or --
+#     when the compiler constant-folds a no-payload variant (e.g. `Right()`
+#     with an empty `just_outputs`) -- an `ops.Const` holding a
+#     `hugr.val.Sum` value reached via `ops.LoadConst` (read `.val.tag`).
+#     Checking only for a live `Tag` op would have silently missed the
+#     constant-folded case.
+#   - Trip-count auto-derivation was investigated and NOT implemented: the
+#     range bound (e.g. `3` for `range(3)`) IS present as a literal `Const`
+#     node in the HUGR when `n` is compile-time-known, but robustly
+#     identifying WHICH of several `Const` nodes represents "the true
+#     iteration bound" (as opposed to the array size used by unrelated
+#     borrow-checking machinery, the step, or other incidental constants)
+#     would require interpreting the specific compiled arithmetic pattern
+#     (counter/bound comparison inside the nested CFG, tuple-packed loop
+#     state) -- a form of abstract interpretation, not reading one
+#     structurally-guaranteed field. This is exactly the kind of "more
+#     design work than fits in one pass" this project's correctness bar
+#     treats as a valid stopping point rather than a fragile guess. Every
+#     TailLoop therefore requires an explicit caller-supplied trip count,
+#     symmetric with CFG-loop trip counts and using the exact same
+#     ``loop_trip_counts`` dict, keyed by the TailLoop node's own ID (there
+#     is no separate "header block" the way a CFG loop has one).
+#   - n_qubits IS scaled by the trip count here (see
+#     `_scale_including_qubits`), unlike CFG while-loops: a qubit allocated
+#     in the continue-Case (e.g. array-comprehension's `qubit()`) becomes
+#     part of the loop-carried state and survives past that iteration,
+#     rather than being freed within it -- the while-loop convention's
+#     justification does not hold, and applying it anyway would silently
+#     undercount, breaking the upper-bound guarantee.
+
+
+def _case_output_tag(hugr: Hugr, case_node: Node) -> int:
+    """Determines which Sum variant (0 = Left/continue, 1 = Right/break) a
+    TailLoop-decision Case's body produces, by tracing its Output node's
+    port-0 source. Verified by hand (see the module-level comment above)
+    against both patterns actually observed: a live ``ops.Tag`` node, and
+    an ``ops.Const``-holding-a-``hugr.val.Sum`` reached via
+    ``ops.LoadConst`` (used when the compiler constant-folds a no-payload
+    variant). Raises ``UnsupportedControlFlowShape`` for anything else --
+    not a general Sum-tag-tracing algorithm, just these two verified
+    patterns."""
+    case_children = list(hugr.children(case_node))
+    output_nodes = [c for c in case_children if isinstance(hugr[c].op, ops.Output)]
+    if len(output_nodes) != 1:
+        raise UnsupportedControlFlowShape(
+            f"Case {case_node} has {len(output_nodes)} Output children "
+            "(expected exactly 1); this shape has not been verified."
+        )
+    links = list(hugr.linked_ports(output_nodes[0].inp(0)))
+    if len(links) != 1:
+        raise UnsupportedControlFlowShape(
+            f"Case {case_node}'s Output port 0 has {len(links)} sources "
+            "(expected exactly 1); this shape has not been verified."
+        )
+    source_node = links[0].node
+    source_op = hugr[source_node].op
+    if isinstance(source_op, ops.Tag):
+        return source_op.tag
+    if isinstance(source_op, ops.LoadConst):
+        const_links = list(hugr.linked_ports(source_node.inp(0)))
+        if len(const_links) == 1:
+            const_op = hugr[const_links[0].node].op
+            if isinstance(const_op, ops.Const) and hasattr(const_op.val, "tag"):
+                return const_op.val.tag
+    raise UnsupportedControlFlowShape(
+        f"Case {case_node}'s output (via node {source_node}, a "
+        f"{type(source_op).__name__}) matches neither verified pattern for "
+        "determining its Sum tag (a direct Tag op, or a LoadConst of a "
+        "Sum-valued Const); this shape has not been verified."
+    )
+
+
+def _walk_tail_loop(hugr: Hugr, tailloop_node: Node, ctx: _WalkCtx) -> _RegionCost:
+    """Walks a TailLoop using the one verified shape -- see the module-level
+    comment above for the full derivation. Raises
+    ``UnsupportedControlFlowShape`` for anything that doesn't match it."""
+    children = list(hugr.children(tailloop_node))
+    conditionals = [c for c in children if isinstance(hugr[c].op, ops.Conditional)]
+    output_nodes = [c for c in children if isinstance(hugr[c].op, ops.Output)]
+    if len(conditionals) != 1 or len(output_nodes) != 1:
+        raise UnsupportedControlFlowShape(
+            f"TailLoop at node {tailloop_node} has {len(conditionals)} "
+            f"Conditional children and {len(output_nodes)} Output children "
+            "(expected exactly 1 each); this shape has not been verified."
+        )
+    decision_cond = conditionals[0]
+    output_node = output_nodes[0]
+
+    for p in range(hugr.num_outgoing(decision_cond)):
+        links = list(hugr.linked_ports(decision_cond.out(p)))
+        if not all(link.node == output_node for link in links):
+            raise UnsupportedControlFlowShape(
+                f"TailLoop at node {tailloop_node}: its Conditional child "
+                f"{decision_cond} does not feed the TailLoop's own Output "
+                "directly; this shape has not been verified."
+            )
+
+    cases = list(hugr.children(decision_cond))
+    if len(cases) != 2:
+        raise UnsupportedControlFlowShape(
+            f"TailLoop at node {tailloop_node}: its decision Conditional "
+            f"{decision_cond} has {len(cases)} Cases (expected exactly 2: "
+            "continue/break); this shape has not been verified."
+        )
+
+    continue_case = break_case = None
+    for case in cases:
+        tag = _case_output_tag(hugr, case)
+        if tag == 0:
+            continue_case = case
+        elif tag == 1:
+            break_case = case
+        else:
+            raise UnsupportedControlFlowShape(
+                f"TailLoop at node {tailloop_node}: Case {case} produces Sum "
+                f"tag {tag} (expected 0 or 1); this shape has not been "
+                "verified."
+            )
+    if continue_case is None or break_case is None:
+        raise UnsupportedControlFlowShape(
+            f"TailLoop at node {tailloop_node}: could not identify both a "
+            f"continue (tag 0) and a break (tag 1) Case among {decision_cond}'s "
+            "Cases; this shape has not been verified."
+        )
+
+    shared_cost = _ZERO_COST
+    for child in children:
+        if child != decision_cond:
+            shared_cost = shared_cost + _walk_child(hugr, child, ctx)
+
+    continue_cost = _walk_region(hugr, continue_case, ctx)
+    break_cost = _walk_region(hugr, break_case, ctx)
+    trip_count = _get_trip_count(tailloop_node, ctx.loop_trip_counts)
+
+    return (
+        _scale_including_qubits(shared_cost, trip_count + 1)
+        + _scale_including_qubits(continue_cost, trip_count)
+        + break_cost
+    )
 
 
 def _natural_loop_nodes(header: Node, back_edge_source: Node, pred: dict[Node, list[Node]]) -> set[Node]:
