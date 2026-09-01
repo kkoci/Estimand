@@ -134,11 +134,104 @@ def _build_model(scheme: Scheme, data_d: int, **scheme_kwargs) -> PhysicalCostMo
     raise ValueError(f"unknown scheme {scheme!r}, expected 'beverland' or 'gidney_fowler'")
 
 
+# --- Auto-selecting data_d for a target total error budget ---
+#
+# See CLAUDE.md "Auto-selecting data_d" for the full derivation. Short
+# version: model.error(algo_summary), for a fixed scheme/gate-counts/
+# physical-error-rate, was verified BY HAND (not assumed) to be
+# monotonically non-increasing in data_d, with a real floor -- not a
+# rounding artifact -- once the magic-state factory's own error
+# contribution (which does NOT depend on data_d; it depends only on
+# factory_ds, a separate parameter) dominates the data block's own
+# contribution (which decays roughly exponentially in data_d, per
+# QECScheme.logical_error_rate's a*(p/p*)**((d+1)/2) form). This makes
+# bisection valid, but it also means a target_error set below that floor
+# is genuinely unachievable by ANY data_d for the given scheme/gate counts
+# -- not a bug, not a search-bound-too-small problem -- and must fail
+# loudly rather than silently return the largest distance tried.
+#
+# Search is restricted to odd d >= 3, matching Qualtran's own convention:
+# QECScheme.code_distance_from_budget() (a similar, but narrower, existing
+# Qualtran utility -- see CLAUDE.md for why we don't just call it directly)
+# always returns an odd d, clamped to a minimum of 3, and Qualtran's own
+# test suite (qec_scheme_test.py::test_invert_error_at) asserts
+# `d % 2 == 1` on its result. d=1 is excluded on the same grounds Qualtran
+# itself excludes it: a distance-1 surface code corrects zero errors, so
+# it isn't a meaningful "smallest code distance" to offer as an answer.
+_MIN_SEARCH_D = 3
+_MAX_SEARCH_D = 100_001
+"""Hard sanity cap on the bisection search, in the sense of CLAUDE.md's
+"no reasonable data_d achieves this" -- not a guess at a typical distance.
+Real surface-code distances in the literature top out around a few
+hundred; growth toward this cap is exponential (each failed probe roughly
+doubles d), so reaching it costs on the order of 15-16 extra model.error()
+calls, not a slow crawl. If growth reaches this cap without achieving
+target_error, _select_data_d_for_target_error raises rather than returning
+d=100_001 as if it were a real answer."""
+
+
+def _select_data_d_for_target_error(
+    scheme: Scheme, target_error: float, algo_summary: AlgorithmSummary, **scheme_kwargs
+) -> int:
+    """Smallest odd code distance d >= 3 whose model.error(algo_summary) is
+    <= target_error, found by bisection over the SAME PhysicalCostModel
+    pipeline _build_model()/estimate() otherwise uses for a fixed data_d --
+    not a separate, hand-derived error formula. See the module-level
+    comment above and CLAUDE.md "Auto-selecting data_d" for why bisection
+    is valid (verified monotonicity) and why the search is odd-only.
+    """
+    if not (target_error > 0):
+        raise ValueError(f"target_error must be a positive number, got {target_error!r}")
+
+    def error_at(d: int) -> float:
+        return _build_model(scheme, d, **scheme_kwargs).error(algo_summary)
+
+    lo_d = _MIN_SEARCH_D
+    lo_error = error_at(lo_d)
+    if lo_error <= target_error:
+        return lo_d
+
+    hi_d = lo_d
+    hi_error = lo_error
+    while hi_error > target_error:
+        if hi_d >= _MAX_SEARCH_D:
+            raise ValueError(
+                f"No code distance up to d={_MAX_SEARCH_D} achieves target_error="
+                f"{target_error:.3e} for scheme={scheme!r} (achieved error="
+                f"{hi_error:.3e} at d={hi_d}). Increasing data_d only reduces the "
+                "data block's own error contribution -- it never reduces the magic "
+                "state factory's, which is independent of data_d (see CLAUDE.md "
+                "'Auto-selecting data_d'), so a target below the factory's own error "
+                "floor can never be reached by any data_d. Try a looser target_error, "
+                "different scheme_kwargs (e.g. smaller factory_ds), or supply data_d "
+                "directly and inspect EstimateResult.error yourself."
+            )
+        hi_d = min(2 * hi_d + 1, _MAX_SEARCH_D)  # 2*odd+1 is odd; stays odd at the cap too
+        hi_error = error_at(hi_d)
+
+    # Bisect on the index k (d = 2k+1) between lo_d (error > target, known
+    # too small) and hi_d (error <= target, known to work) for the
+    # smallest d that still achieves the target. Correct even across the
+    # error-vs-d plateau confirmed above: bisection only ever needs "is
+    # this d's error <= target", never strict monotonic separation between
+    # neighboring probes.
+    lo_k, hi_k = (lo_d - 1) // 2, (hi_d - 1) // 2
+    while hi_k - lo_k > 1:
+        mid_k = (lo_k + hi_k) // 2
+        mid_d = 2 * mid_k + 1
+        if error_at(mid_d) <= target_error:
+            hi_k = mid_k
+        else:
+            lo_k = mid_k
+    return 2 * hi_k + 1
+
+
 def estimate(
     compiled: Package | Hugr,
     *,
     scheme: Scheme = "beverland",
-    data_d: int = 17,
+    data_d: int | None = None,
+    target_error: float | None = None,
     upper_bound: bool = False,
     loop_trip_counts: dict[int, int] | None = None,
     **scheme_kwargs,
@@ -152,10 +245,19 @@ def estimate(
             Beverland et al. 2022 (arXiv:2211.07629); ``"gidney_fowler"``
             follows Gidney & Fowler's CCZ magic-state factory model. Both are
             Qualtran's implementations, not reimplemented here.
-        data_d: Surface-code distance for the data block. This is NOT
-            optimized for the target error budget in v1 -- callers must pick
-            a distance and check the resulting `error` themselves. See
-            CLAUDE.md "Known limitations".
+        data_d: Surface-code distance for the data block, fixed by the
+            caller. Mutually exclusive with ``target_error`` -- exactly one
+            of the two must be supplied.
+        target_error: Instead of a fixed ``data_d``, auto-select the
+            smallest odd code distance (>= 3) whose resulting ``error`` is
+            <= this budget, via bisection over the same
+            ``PhysicalCostModel.error()`` this module already uses for a
+            fixed ``data_d`` -- not a separate, hand-derived formula. See
+            CLAUDE.md "Auto-selecting data_d" for the verified monotonicity
+            this relies on, and its caveats (e.g. it can never reach an
+            error below the magic-state factory's own, ``data_d``-
+            independent error floor -- see the ``ValueError`` below).
+            Mutually exclusive with ``data_d``.
         upper_bound: If True, opt into worst-case bounding for programs with
             conditionals/loops instead of raising ControlFlowNotSupported:
             every conditional contributes the max of its branches (only one
@@ -174,6 +276,11 @@ def estimate(
             for beverland).
 
     Raises:
+        ValueError: neither or both of ``data_d``/``target_error`` were
+            supplied; or ``target_error`` was supplied but no code distance
+            up to this module's search cap achieves it (the error message
+            names the achieved error at the search boundary -- see
+            CLAUDE.md "Auto-selecting data_d").
         ControlFlowNotSupported: the program contains a conditional or loop
             and ``upper_bound`` is False (v1's default is straight-line
             programs only).
@@ -190,6 +297,17 @@ def estimate(
         compiled, upper_bound=upper_bound, loop_trip_counts=loop_trip_counts
     )
     algo_summary = AlgorithmSummary(n_algo_qubits=n_qubits, n_logical_gates=gate_counts)
+
+    if (data_d is None) == (target_error is None):
+        raise ValueError(
+            "estimate() requires exactly one of `data_d` (a fixed code distance) or "
+            "`target_error` (auto-select the smallest odd code distance achieving this "
+            "total error budget) -- got "
+            + ("neither" if data_d is None else "both")
+        )
+    if target_error is not None:
+        data_d = _select_data_d_for_target_error(scheme, target_error, algo_summary, **scheme_kwargs)
+
     model = _build_model(scheme, data_d, **scheme_kwargs)
 
     return EstimateResult(

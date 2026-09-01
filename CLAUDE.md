@@ -477,8 +477,14 @@ found and fixed, not just confirmed-correct-by-luck:**
   "Bounded control flow (opt-in)" below for the `upper_bound=True`
   alternative added 2026-09-02, which is scoped and limited, not a full
   replacement.
-- `data_d` (surface-code distance) is a caller-supplied parameter, not
-  auto-selected to hit a target logical error rate.
+- `data_d` (surface-code distance) can be fixed directly by the caller, or
+  auto-selected via `target_error` — see "Auto-selecting data_d" below.
+  Auto-selection finds the smallest *odd* distance (>= 3) achieving the
+  budget, assuming Qualtran's own error model; it inherits that model's
+  known caveats (e.g. quantumlib/Qualtran#1944 — see VERIFICATION.md),
+  since it calls the exact same `model.error()` a fixed-`data_d` estimate
+  does. It also cannot ever reach an error below the magic-state factory's
+  own, `data_d`-independent error floor, for the same reason.
 - Any quantum op not in `gate_counts.py`'s classification tables raises
   `UnrecognizedGate` rather than being silently dropped.
 
@@ -1270,6 +1276,177 @@ end-to-end with the real, unmodified qshelf source — same standard as the
 pattern found rather than a special case, and report the true boundary
 rather than smoothing over it.
 
+## Auto-selecting data_d (2026-09-08)
+
+Resolves the oldest item on the "Possible future work" list below —
+present since this project's very first version, untouched while every
+pass since then was control-flow/call-resolution correctness work rather
+than new estimator capability: `estimate()` required a caller-supplied
+`data_d`, with no way to ask "what's the smallest distance that keeps
+total error under X" other than manually trying values and inspecting
+`.error`. Same discipline as every other pass: verify the assumption
+bisection depends on (monotonicity) by hand before writing any search
+code, don't assume it.
+
+**Step 1 — confirm error() actually scales monotonically in data_d, by
+computing it, not by assuming it.** Read `PhysicalCostModel.error()`
+(`qualtran/surface_code/physical_cost_model.py`) and its two constituent
+sources directly (`inspect.getsource`, not docs):
+
+```python
+factory_error = self.factory.factory_error(n_logical_gates, self.logical_error_model)
+data_error = self.data_block.data_error(n_algo_qubits, n_cycles, self.logical_error_model)
+error = factory_error + data_error
+```
+
+Critically: `factory_error` is computed from the factory's *own* internal
+distances (`factory_ds`, a separate constructor parameter defaulting to
+`(9, 3, 3)` for the beverland scheme) — **not** from `data_d` at all.
+Only `data_error` (via `DataBlock.data_error`, in `data_block.py`) depends
+on `data_d`:
+
+```python
+def data_error(self, n_algo_qubits, n_cycles, logical_error_model):
+    spacetime_volume = self.n_tiles(n_algo_qubits) * n_cycles
+    return spacetime_volume * logical_error_model(self.data_d)
+```
+
+where `logical_error_model(d)` is `QECScheme.logical_error_rate`, already
+verified exact against Beverland's Appendix A in `VERIFICATION.md` §3a:
+`a * (p / p_threshold) ** ((d + 1) / 2)` — exponential decay in `d`. Also
+note `n_cycles = data_d * n_steps` (`DataBlock.n_cycles`) — a *linear-in-d*
+prefactor multiplying that exponential decay. This predicts, analytically,
+before running anything: `data_error(d)` should fall off roughly
+exponentially (the linear prefactor can't win against an exponential for
+reasonable physical-error/threshold ratios), so `error(d) = factory_error
++ data_error(d)` should decrease monotonically toward an asymptotic floor
+of `factory_error` (a constant, independent of `data_d`) as `d` grows —
+**and, importantly, never go below that floor**, no matter how large `d`
+gets, because `factory_error` doesn't shrink with `data_d` at all.
+
+**Confirmed this prediction numerically, not just analytically** — swept
+`data_d` from 1 to 1001 (well past any practical value) for both schemes,
+against three different gate-count profiles including the real,
+hand-verified Grover result from "CallIndirect support" above
+(`toffoli=4, clifford=47`), specifically checking the small-`d` edge (d=1,
+d=3) the task flagged as a place formulas can misbehave:
+
+```
+beverland (real Grover gate profile):
+d=   1 error=7.584325e+00
+d=   3 error=7.587253e-01  DEC
+d=   5 error=7.616534e-02  DEC
+...
+d=  17 error=3.254878e-04  DEC
+d=  21 error=3.253428e-04  DEC
+d=  51 error=3.253410e-04  DEC
+d=  65 error=3.253410e-04  SAME  <- floor reached; factory_error dominates
+d= 301 error=3.253410e-04  SAME
+```
+
+No inversion anywhere, including at d=1 and d=3 — every step is `DEC` or
+(once the floor is reached) `SAME`, never `INC`, across both schemes and
+all three gate profiles tried. **Monotonically non-increasing, with a
+real, non-rounding-artifact floor — confirmed, not assumed.** This makes
+bisection valid, with one necessary adjustment: because of the floor, the
+search must be prepared for "no `data_d` achieves this target" as a real,
+common outcome (any `target_error` below `factory_error` for the given
+`factory_ds`), not an edge case to paper over.
+
+**Step 2 — is `data_d` required to be odd?** Checked Qualtran's own code
+and test suite rather than assuming either way.
+`QECScheme.code_distance_from_budget()` — an existing, narrower Qualtran
+utility that inverts the *raw* `logical_error_rate` formula alone (not the
+full `PhysicalCostModel.error()` this project needs, which also includes
+the data-block/factory composition and cycle-count dependence) — always
+returns an odd `d`, via `d = 2 * math.ceil(r) - 1`, clamped to a minimum
+of 3. Its own test
+(`qualtran/surface_code/qec_scheme_test.py::test_invert_error_at`)
+explicitly asserts `d % 2 == 1` on the result. This confirms odd-only,
+`d >= 3` is Qualtran's own established convention (matching the general
+surface-code-literature convention that only an odd distance gives a
+well-defined, integer number of correctable errors, `(d-1)/2`) — not
+independently invented here. `guppy_estimand`'s own search adopts the same
+convention, but performs its own bisection over the *full*
+`PhysicalCostModel.error()` rather than calling
+`code_distance_from_budget()` directly, since that method only inverts the
+QEC scheme's bare formula and has no way to account for the
+factory/data-block composition (in particular, no way to express or
+detect the `factory_error` floor at all).
+
+**Step 3 — implementation** (`src/guppy_estimand/estimate.py`):
+`_select_data_d_for_target_error(scheme, target_error, algo_summary,
+**scheme_kwargs)` bisects over the *index* `k` into odd distances (`d = 2k
++ 1`), calling `_build_model(scheme, d, **scheme_kwargs).error(algo_summary)`
+at each probe — the exact same function `estimate()` uses for a
+caller-supplied `data_d`, not a second, parallel error-model
+implementation. Search bounds and edge-case behavior, decided explicitly:
+
+- **Floor at `d = 3`** (never `d = 1`, per Step 2). If `error(3) <=
+  target_error` already, returns 3 immediately — the trivially-loose-
+  target case (a target looser than what even the smallest meaningful
+  distance already achieves) is not an error, just an instant answer.
+- **Upper bound found by exponential growth**, not a fixed guess: starting
+  from `d=3`, repeatedly probes `d -> 2d+1` (odd-preserving) until either
+  `error(d) <= target_error` (bracket found) or a hard cap,
+  `_MAX_SEARCH_D = 100_001`, is reached. Growth is exponential, so reaching
+  the cap costs on the order of 15-16 extra `error()` calls, not a slow
+  crawl — the cap is cheap to check even though it's rarely needed.
+- **Unachievable target: fails loudly, not silently.** If `error(d)` still
+  exceeds `target_error` at `d = _MAX_SEARCH_D`, raises `ValueError` naming
+  both the cap and the *achieved* error there — e.g. `"No code distance up
+  to d=100001 achieves target_error=1.000e-04 ... (achieved
+  error=3.253e-04 at d=100001)"` — rather than returning `d=100_001` as if
+  it were a genuine answer (it wouldn't actually meet the budget) or some
+  other extreme/wrong distance. Per Step 1, this is the expected, correct
+  outcome whenever `target_error` is set below the scheme's own
+  `factory_error` floor for the given gate counts/`factory_ds` — not a
+  search-bound-too-small bug to work around by raising the cap further.
+- Once a bracket `[lo_d, hi_d]` is established, standard integer bisection
+  over `k` finds the smallest `d` with `error(d) <= target_error`. This
+  works correctly even across the plateau confirmed in Step 1 (multiple
+  neighboring `d`'s sharing the identical floor value): bisection only
+  ever needs the boolean "does this `d`'s error meet the target", never
+  strict separation between probes.
+- `target_error <= 0` raises `ValueError` immediately (not silently
+  treated as "any distance works" or passed through to produce a
+  nonsensical bisection).
+
+**Step 4 — verification.** `tests/test_target_error.py` (24 tests, all
+scheme-aware since beverland's and gidney_fowler's `factory_error` floors
+differ by many orders of magnitude for the same gate counts — beverland's
+floor for `bell_and_t` is ~2.033e-05, gidney_fowler's is ~5.333e-11,
+checked by hand before picking test target values, not guessed):
+mutual-exclusivity validation (neither/both of `data_d`/`target_error`
+raises); `target_error <= 0` raises; the returned `data_d` actually
+achieves the budget across both schemes and several target values; **the
+returned `data_d` is the *smallest* such distance**, not merely a
+sufficient one — checked by also computing `error()` at `data_d - 2` (the
+next smaller odd distance) and confirming it does NOT meet the target
+(larger `data_d` costs more physical qubits via `2*d^2` per tile, so
+returning a looser-than-necessary distance would silently inflate
+`n_phys_qubits`); the auto-selected result is byte-for-byte identical
+(`n_phys_qubits`, `duration_hr`, `error`) to calling `estimate()` with that
+exact `data_d` directly, confirming auto-selection isn't a parallel
+code path with its own numbers; the trivially-loose-target case returns
+`d=3` exactly (not `d=1`); the unachievable case raises with the achieved
+error shown; and one test bisects against the real, hand-verified Grover
+gate profile from "CallIndirect support" above
+(`toffoli=4, clifford=47`), not just the synthetic `bell_and_t` toy.
+
+**Honest bottom line**: monotonicity held cleanly across every probe
+tried — no rounding/ceiling anomaly ever forced a fallback to linear scan,
+so bisection is exactly what's implemented, over the real
+`PhysicalCostModel.error()` pipeline, not a hand-derived approximation of
+it. The one caveat worth restating plainly: because `factory_error` is
+`data_d`-independent, `target_error` auto-selection has a hard floor per
+scheme/gate-counts/`factory_ds` that no amount of increasing `data_d` can
+cross — this is a real property of the underlying model (and, per
+quantumlib/Qualtran#1944, already caveated as understated by ~4.9x for the
+beverland scheme's factory-error component specifically — see
+"Decision: adapter to Qualtran" above), not a limitation introduced by
+this feature's search strategy.
+
 ## Possible future work (not started)
 
 - ~~Support straight-line-with-known-bounds control flow...~~ **Done,
@@ -1299,7 +1476,12 @@ rather than smoothing over it.
   straight-line programs using `array[qubit, n]` indexing don't
   unnecessarily raise `UnrecognizedGate` on `collections.borrow_arr.*`
   bookkeeping ops.
-- Auto-select `data_d` for a target total error budget (bisection over
-  Qualtran's `model.error()`).
+- ~~Auto-select `data_d` for a target total error budget~~ **Done,
+  2026-09-08 — see "Auto-selecting data_d" above.** `estimate(...,
+  target_error=...)` bisects over `model.error()` (verified monotonic
+  first, not assumed) for the smallest odd `data_d >= 3` meeting the
+  budget; a target below the magic-state factory's own `data_d`-
+  independent error floor raises `ValueError` naming the achieved error,
+  rather than silently returning a distance that doesn't actually work.
 - `hugr-qir`-based cross-check: independently estimate from the QIR output
   and compare, as a consistency check on the direct-HUGR gate-count walker.

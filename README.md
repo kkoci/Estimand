@@ -94,12 +94,75 @@ found two confirmed bugs, both filed upstream and open as of 2026-09-01:
   times but appear once in the graph). Rather than silently produce a
   wrong number, `estimate()` raises `ControlFlowNotSupported` if it finds
   one — *unless* you opt into bounded mode, see below.
-- **`data_d` (code distance) is not auto-selected** for a target logical
-  error rate. You choose a distance and check the resulting `error` field
-  yourself.
+- **`data_d` (code distance) auto-selection has one hard limit.**
+  `estimate(..., target_error=...)` (see "Auto-selecting data_d" below)
+  finds the smallest odd distance meeting your error budget, but it can
+  never reach an error below the magic-state factory's own `error`
+  contribution, which doesn't depend on `data_d` at all — a `target_error`
+  set below that floor fails loudly rather than returning a distance that
+  doesn't actually work.
 - **Unrecognized gates fail loudly**, not silently. If guppylang adds a new
   quantum op, `estimate()` raises `UnrecognizedGate` rather than dropping it
   from the count.
+
+## Auto-selecting data_d
+
+Instead of picking `data_d` yourself and checking `result.error`, pass
+`target_error` and `estimate()` finds the smallest odd code distance
+(>= 3) that keeps total error at or below your budget, via bisection over
+the same `PhysicalCostModel.error()` pipeline a fixed-`data_d` call uses —
+not a separate, hand-derived formula. `data_d` and `target_error` are
+mutually exclusive; supplying neither or both raises `ValueError`.
+
+```python
+result = estimate(bell_and_t.compile(), scheme="beverland", target_error=1e-4)
+print(result)
+```
+
+Actual output:
+
+```
+guppy-estimand result (scheme=beverland, code distance d=11)
+  logical qubits:    2
+  logical gates:     t: 1, clifford: 2, measurement: 2
+  physical qubits:   2,598
+  runtime:           1.100e-08 hours
+  total error:       3.815e-05
+  note: physical qubits include a local fix for a confirmed Qualtran bug (https://github.com/quantumlib/Qualtran/issues/1943); see CLAUDE.md.
+  note: total error is understated ~4.9x vs. the cited paper's own constant, unpatched (https://github.com/quantumlib/Qualtran/issues/1944); see CLAUDE.md.
+```
+
+`d=11` (not `d=17`, the value used elsewhere in this README) because it's
+the *smallest* odd distance that meets `1e-4` for this program — a looser
+target than `d=17`'s own `2.036e-05`, so a smaller, cheaper distance
+suffices. See `CLAUDE.md` "Auto-selecting data_d" for the full
+by-hand monotonicity verification this search relies on.
+
+**There's a hard floor.** Total error is `factory_error + data_error`, and
+only `data_error` depends on `data_d` — `factory_error` comes from the
+magic-state factory's own, fixed internal distances (`factory_ds`,
+independent of `data_d`). No `data_d`, however large, can push total error
+below `factory_error`. A `target_error` set below that floor fails loudly,
+naming the achieved error at the search boundary, instead of silently
+returning a distance that doesn't actually work:
+
+```python
+>>> estimate(bell_and_t.compile(), scheme="beverland", target_error=1e-10)
+ValueError: No code distance up to d=100001 achieves target_error=1.000e-10
+for scheme='beverland' (achieved error=2.033e-05 at d=100001). Increasing
+data_d only reduces the data block's own error contribution -- it never
+reduces the magic state factory's, which is independent of data_d (see
+CLAUDE.md 'Auto-selecting data_d'), so a target below the factory's own
+error floor can never be reached by any data_d. Try a looser target_error,
+different scheme_kwargs (e.g. smaller factory_ds), or supply data_d
+directly and inspect EstimateResult.error yourself.
+```
+
+Auto-selection calls the exact same `model.error()` a fixed-`data_d`
+`estimate()` call does, so it inherits that model's own caveats unchanged
+— including quantumlib/Qualtran#1944 above (the `"beverland"` scheme's
+factory error is understated ~4.9x, which also means its *floor* is
+understated by the same amount).
 
 ## Bounded control flow (opt-in, `upper_bound=True`)
 
