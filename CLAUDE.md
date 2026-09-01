@@ -533,12 +533,16 @@ still need its own hand-verification pass, per this project's correctness
 bar, before being supported — none has been done, including for the
 now-confirmed-real `TailLoop` case.
 
-Also **not supported, found via the same real-world stress test, and more
-serious than any of the above**: calling a function that was compiled as a
-separate, non-inlined `FuncDefn` (`CallNotSupported`, added 2026-09-04).
-See "Real-world stress test" below — this one was a genuine silent
-undercount before the fix, not just an unhandled shape refused loudly from
-the start.
+**Update (2026-09-05): calling a non-inlined function is no longer in this
+"not supported" list.** It was, briefly (`CallNotSupported`, added
+2026-09-04, after the same real-world stress test found it as a genuine
+silent undercount — the most serious finding of that pass, more serious
+than the `TailLoop` case above). It is now followed and walked instead —
+see "Call-following" below for the fix, the trip-count composition design
+across call boundaries, and the qshelf re-run. `CallNotSupported` still
+exists, narrowed to the genuinely irresolvable case (`CallIndirect`, or a
+`Call` targeting a `FuncDecl`); a new exception,
+`RecursiveCallNotSupported`, covers a cyclic call graph.
 
 ## Real-world stress test (2026-09-04): QFT from kkoci/Qshelf
 
@@ -684,6 +688,207 @@ because every synthetic test so far was a single self-contained function.
 That is the primary, most valuable result of this exercise, not the
 6-clifford/3-rotation number.
 
+## Call-following (2026-09-05)
+
+Replaces the blanket `CallNotSupported` stopgap from the real-world stress
+test above with real call-following: both walkers now recurse into a
+called function's own body using the same traversal that's walking the
+caller, instead of refusing every non-inlined call. Same discipline as
+every prior pass — HUGR structure verified by hand before any code was
+written, not assumed.
+
+**Step 1 — how `ops.Call` actually resolves to its target, precisely.**
+Inspected the installed `hugr` 0.18.5 `ops.Call` class directly
+(`inspect.getsource`), rather than assuming the earlier ad hoc "last input
+port" heuristic (used by the original `CallNotSupported` for its error
+message only, never load-bearing) was principled. Found:
+`Call._function_port_offset()` returns `len(self.signature.body.input)` —
+the count of ordinary dataflow input ports; the function-pointer edge (a
+*static*, function-typed edge, not a regular dataflow edge) is the port
+immediately after them, resolved via
+`hugr.linked_ports(call_node.inp(offset))`. Confirmed the earlier "last
+port" heuristic only coincided with this because `Call` has no other port
+kinds beyond dataflow args + one function pointer — the principled offset
+is used now (`_resolve_call_target` in `gate_counts.py`).
+
+Also verified by hand, using `discard_array` at two different array sizes
+compiled into one program: **calling the *same* instantiation of a
+function from two different call sites resolves both `Call` nodes to the
+*same* `FuncDefn` node** (guppylang does not duplicate the body per call
+site) — this is what makes memoizing a callee's cost by its `FuncDefn`
+node ID both correct and effective. Calling *different* instantiations of
+a generic function (e.g. `discard_array` at array sizes 2 and 3) DOES
+produce distinct `FuncDefn` nodes (observed names `discard_array$2` vs.
+`discard_array$3`), confirmed by node ID, so this never conflates them.
+
+Not otherwise relevant here, but checked: `ops.FuncDecl` (external/opaque
+function declaration, no body in this compiled unit) and `ops.CallIndirect`
+(a call whose target is a runtime dataflow value, not a static edge) both
+exist as HUGR concepts. Neither was ever observed produced by any guppy
+source pattern tried in this project — `CallNotSupported` is narrowed to
+cover them as a documented, defensive case, not something independently
+reproduced from real guppy code (see "What's not independently verified"
+below).
+
+`_as_hugr` still rejects multi-module `Package`s outright (unchanged,
+pre-existing behavior), so whether a `Call` could ever target a `FuncDefn`
+in a *different* module of a multi-module package never arises in this
+codebase — noting this as an explicit non-issue rather than a silently
+unconsidered case.
+
+**Step 2 — the walker change, and the trip-count composition design
+decision.** Both `_walk_region` (bounded mode) and the straight-line
+walker (rewritten from a flat `hugr.descendants()` loop into a recursive
+`_walk_region_straight_line`, structurally mirroring the bounded walker,
+for the same reason bounded mode already uses `children()`-with-explicit-
+recursion rather than `descendants()`) now handle `ops.Call` by resolving
+the target and recursively walking it with the *same* walking function
+(`_walk_call`, shared by both modes) — so a straight-line caller's callee
+must itself be straight-line (raises `ControlFlowNotSupported` on any
+control flow found anywhere in the call graph, not just directly in the
+caller), and a bounded caller's callee gets the full conditional-max/
+loop-trip-count treatment.
+
+**Design decision, made explicit rather than left implicit (see
+`_WalkCtx`'s docstring in `gate_counts.py` for the full reasoning)**:
+`loop_trip_counts` stays a *flat* dict keyed by HUGR node ID — **not**
+namespaced per call site. This falls directly out of the Step 1 finding
+that the same instantiation shares one `FuncDefn`: a loop inside a callee
+has one fixed, globally-unique header node ID no matter how many places
+call it, so no new keying scheme was needed. What this gets right
+automatically, with zero special-casing: call the same function once
+outside a loop and once inside a caller-side loop with trip count `N`, and
+its cost is added once at `1x` and once at `Nx` — each call site's own
+surrounding structure (loop, conditional, or neither) multiplies the
+callee's memoized-but-recomputed-per-site cost independently, because
+`func_memo` only avoids *recomputing* a callee's walk, never avoids
+*re-adding* it once per call site that reaches it. The one real limitation
+this implies, documented rather than hidden: if the same callee is called
+from multiple sites and its own internal loop should truly run a different
+number of times depending on which site called it, that cannot be
+expressed — one node ID, one trip count, applied everywhere that loop is
+reached.
+
+Recursion is guarded via a `call_stack: frozenset` threaded through the
+same context object (`_WalkCtx`), containing every `FuncDefn` currently
+being walked on the path from the entrypoint. A `Call` whose target is
+already in `call_stack` raises `RecursiveCallNotSupported` naming the
+cycle, checked *before* any recursive walk is attempted (not caught via
+Python's own `RecursionError`, and not silently masked by memoization
+returning a stale/incomplete result).
+
+**Step 3 — repeated calls to the same function, verified with a dedicated
+test, not just reasoned about.** Built a helper function called from two
+different call sites in one program: once outside any loop, once inside a
+caller-side `while` loop with a trip count. A plain, small user-defined
+helper was found (by hand, empirically) to reliably get *inlined* by
+guppylang regardless of size tried up to 32 gates across 2 call sites —
+so, to get a genuinely non-inlined, fully-hand-controlled test callee (as
+opposed to relying on a stdlib function's own, more complex internal
+structure), a 100-clifford-gate helper was used, confirmed by hand to
+still compile as a separate `FuncDefn`. Result:
+`tests/test_call_following.py::test_same_callee_called_outside_and_inside_a_loop`
+— gate count exactly `100 * (1 + trip_count)` for `trip_count` in
+`{0, 3, 7}`, confirming the outside call contributes `1x` and the inside
+call contributes `trip_count x` independently, not `2x` (which a naive
+"memoize the whole answer, not just the callee's own cost" bug would give)
+and not just `1x` (which would silently drop the loop multiplication for
+the second call). A companion test
+(`test_same_callee_memoized_not_recomputed_but_recounted_per_site`) calls
+the same helper from three sites, all outside any loop, confirming `3x`
+exactly — checking that memoization (avoiding re-walking the callee's
+body) never becomes accidental de-duplication (undercounting how many
+times its cost should be added).
+
+**Step 4 — recursion, verified with a real recursive guppy function, not
+a hypothetical.** guppylang does allow writing genuine recursion (checked
+by hand, not assumed) — a function calling itself, and indirect/mutual
+recursion (A calls B calls A), both compile and reach `.compile()`
+successfully. A recursive function cannot be inlined by construction (no
+finite inlining depth), so it reliably produces a real `Call` node
+pointing back into a cycle, giving a clean, fully-controlled test case —
+unlike the inlining-threshold guesswork needed for Step 3's non-recursive
+tests. Both direct and indirect recursion are correctly detected and
+raise `RecursiveCallNotSupported` in bounded mode
+(`tests/test_call_following.py::test_direct_recursion_detected_in_bounded_mode`,
+`::test_indirect_mutual_recursion_detected`).
+
+**Honest nuance found, not glossed over**: for straight-line mode
+specifically, the *same* recursive test program instead raises
+`ControlFlowNotSupported` — because the recursive function's own base-case
+check (an `if n > 0:`) is itself a HUGR `CFG`, which straight-line mode
+refuses outright, before ever reaching the recursive `Call` node one level
+deeper. This is not a coincidence specific to the example: any practical
+recursive function needs a base case to terminate, which is expressed as a
+conditional, so in practice straight-line mode is expected to always hit
+`ControlFlowNotSupported` before `RecursiveCallNotSupported` for real
+recursive guppy code. The recursion-cycle-detection code itself is shared
+between both walkers (`_walk_call`) and is directly exercised by the
+bounded-mode test above; the straight-line-mode test
+(`::test_direct_recursion_in_straight_line_mode_fails_loudly_one_way_or_another`)
+only confirms straight-line mode doesn't silently succeed or hang instead,
+accepting either exception rather than asserting a specific one it cannot
+actually reach.
+
+**What's NOT independently verified**: `CallNotSupported`'s two remaining
+narrow cases (`CallIndirect`, and a `Call` targeting a `FuncDecl`) have no
+known guppy source pattern that produces them — `tests/test_call_following.py::test_call_not_supported_still_importable_for_opaque_calls`
+is a smoke test that the exception class and its docstring exist, not a
+HUGR-level repro of triggering either code path. Documented as an honest
+gap rather than a fabricated test asserting behavior nobody has actually
+exercised.
+
+**Step 5 — re-running the qshelf QFT stress test, full honest result.**
+Swept `n = 2..6` again (same registers as the original inlining-threshold
+sweep), using the REAL idiomatic `discard_array(qs)` call throughout — no
+workaround needed for it anymore — with a literal array construction
+(`array(qubit(), qubit(), ...)`) still required, since the array-
+*comprehension* idiom's `TailLoop` shape (found in the first pass) is a
+completely separate HUGR shape that call-following does not touch and
+remains unsupported. **Result: all five register sizes succeed and match
+the closed-form hand-derived formula for QFT's structure exactly**:
+
+```
+H count     = n
+CRz count   = n(n-1)/2        (triangular number: sum_{i=0}^{n-1} (n-1-i))
+swap count  = n // 2          (each swap = 3 CX)
+clifford    = H + 3*(n//2)  = n + 3*(n//2)
+rotation    = CRz            = n*(n-1)/2
+```
+
+| n | clifford (H + 3⌊n/2⌋) | rotation (n(n-1)/2) | Walker output | Match |
+|---|---|---|---|---|
+| 2 | 2 + 3 = 5   | 1  | `clifford: 5, rotation: 1`   | exact |
+| 3 | 3 + 3 = 6   | 3  | `clifford: 6, rotation: 3`   | exact |
+| 4 | 4 + 6 = 10  | 6  | `clifford: 10, rotation: 6`  | exact |
+| 5 | 5 + 6 = 11  | 10 | `clifford: 11, rotation: 10` | exact |
+| 6 | 6 + 9 = 15  | 15 | `clifford: 15, rotation: 15` | exact |
+
+`n_qubits` also matched `n` exactly at every size. `discard_array`'s own
+internal loop needs a trip count (it has one — a real loop, discovered via
+`LoopTripCountMissing` at every `n`), but the *value* supplied for it was
+confirmed, by hand, not to affect the reported gate counts at all (checked
+1, 4, and 100 all give identical output at `n=4`) — `discard_array`'s only
+quantum op is `QFree`, which is `_IGNORED` (zero-cost) — so this doesn't
+threaten the correctness of the table above, but it is worth noting as a
+minor real-world usability wrinkle: a caller must still supply *some*
+non-negative integer for that loop to get past `LoopTripCountMissing`,
+even though, in this specific case, its value turns out not to matter.
+
+Full `estimate()` output (physical qubits/runtime/error, scheme=beverland,
+`d=17`) for all five sizes is in `examples/qft_n.py`'s actual run output
+and README.md "Real-world stress test" — physical qubit count and runtime/
+error all scale monotonically with `n`, as expected.
+
+**Honest bottom line, updated**: call-following resolved the single most
+serious finding from the first stress-test pass — QFT is now estimable at
+every register size tested, using qshelf's own real, idiomatic
+`discard_array` pattern, not a workaround. The array-comprehension
+`TailLoop` gap from the first pass remains genuinely open (a different
+problem this task was not asked to fix); `examples/qft_n.py` demonstrates
+it still failing, for real, rather than silently dropping it from the
+example now that the headline result looks better.
+
 ## Possible future work (not started)
 
 - ~~Support straight-line-with-known-bounds control flow...~~ **Done,
@@ -692,19 +897,16 @@ That is the primary, most valuable result of this exercise, not the
   `for`-loop/iterator support, loops with internal `break`, full `TailLoop`
   support (now confirmed reachable in practice, via array comprehensions —
   see "Real-world stress test" above; still unimplemented).
-- **Follow `ops.Call` edges into non-inlined callees** (found 2026-09-04,
-  see "Real-world stress test" above). Currently `CallNotSupported` fails
-  loudly instead of silently under-counting, which is the right interim
-  behavior, but it blocks estimating essentially any real guppy program
-  that calls a helper function not small/simple enough to be inlined —
-  including, concretely, any qshelf algorithm at a realistic qubit count.
-  Needs: recursing into the callee's own `FuncDefn` subtree with the same
-  walker, memoization keyed by FuncDefn (a function called from multiple
-  sites shouldn't be re-walked each time), and a decision on what to do
-  about recursive calls (a trip-count-like mechanism, analogous to loops,
-  is the likely shape of a solution, but hasn't been designed). This is
-  now the highest-priority item on this list — found via real code, not
-  hypothetical.
+- ~~Follow `ops.Call` edges into non-inlined callees~~ **Done, 2026-09-05 —
+  see "Call-following" below.** `CallNotSupported` is narrowed to
+  genuinely irresolvable calls (`CallIndirect`, or a `Call` targeting a
+  `FuncDecl`); an ordinary call to a defined function is now followed and
+  walked, with recursion detected and refused as
+  `RecursiveCallNotSupported`. Re-running the qshelf QFT stress test with
+  this in place now succeeds across the full `n=2..6` range tested, using
+  the real, idiomatic `discard_array(qs)` call — see "Real-world stress
+  test" for the original finding and "Call-following" for the fix and
+  re-run.
 - Extend non-`tket.*`-ExtOp tolerance (currently bounded-mode-only, and
   only as a side effect of a rule designed for something else — see "Real-
   world stress test" point 3 above) to the straight-line walker too, so

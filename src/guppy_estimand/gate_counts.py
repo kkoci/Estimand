@@ -107,27 +107,51 @@ class UnsupportedControlFlowShape(NotImplementedError):
 
 
 class CallNotSupported(NotImplementedError):
-    """Raised (in both straight-line and ``upper_bound`` mode) when the
-    HUGR contains an ``ops.Call`` node: a call to a function that was
-    compiled as a separate ``FuncDefn`` rather than inlined at the call
-    site.
+    """Raised when the HUGR contains a call this project cannot see through
+    to a walkable function body.
 
-    Neither walker follows ``Call`` edges into the callee's own FuncDefn --
-    its gates are otherwise entirely invisible, which would silently
-    undercount (potentially down to zero) any real program that calls a
-    non-inlined helper function. This is not a hypothetical: verified by
-    hand against a real algorithm (qshelf's QFT, see CLAUDE.md "Real-world
-    stress test") that guppylang 1.0.2 inlines small generic-comptime
-    functions but compiles them as a separate, called FuncDefn once they
-    cross some size/complexity threshold -- e.g. `qft` was inlined for a
-    4-qubit register but NOT for 4+ qubits, with no other change to the
-    calling code. Before this was raised, `extract_gate_counts` silently
-    returned near-zero gate counts (only the caller's own directly-visible
-    ops) for the non-inlined case, with no indication anything was missing.
+    **Narrowed 2026-09-05** (see CLAUDE.md "Call-following"): both walkers
+    now follow ``ops.Call`` edges into the callee's own ``FuncDefn`` and
+    walk its body with the same traversal used for the caller -- so a call
+    to an ordinary, defined guppy function (inlined or not) is no longer
+    what raises this. It is now raised only for a call this project
+    genuinely cannot resolve to a body to walk:
 
-    There is no supported workaround yet -- following ``Call`` edges into
-    arbitrary callees (with memoization, and handling for recursive calls)
-    is unimplemented. See CLAUDE.md "Possible future work".
+    - ``ops.CallIndirect`` -- the target is a runtime dataflow value (e.g.
+      a function passed as a first-class value), not a static edge to a
+      known ``FuncDefn``, so there is nothing fixed to walk.
+    - A ``Call`` whose static function-pointer edge resolves to an
+      ``ops.FuncDecl`` (or anything other than ``ops.FuncDefn``) -- a
+      ``FuncDecl`` is an external/opaque function declaration with no
+      body present in this compiled unit at all (e.g. an extern), so
+      there is nothing to walk regardless of how hard this project looks.
+
+    Previously (before 2026-09-05) this was raised for *every* call to a
+    non-inlined function, which is not a hypothetical gap: guppylang 1.0.2
+    was found (via a real-world stress test, see CLAUDE.md "Real-world
+    stress test") to inline small functions but compile larger ones (e.g.
+    `guppylang.std.quantum.discard_array`, or qshelf's `qft` above ~4
+    qubits) as separate, called functions -- and before any fix, their
+    gates were silently invisible, with no error, undercounting real
+    programs down to near-zero. That silent-undercount failure mode no
+    longer exists for a resolvable ``Call``; only genuinely irresolvable
+    calls raise this now.
+    """
+
+
+class RecursiveCallNotSupported(NotImplementedError):
+    """Raised when the call graph (starting from the entrypoint) contains a
+    cycle -- direct self-recursion (a function calling itself) or indirect/
+    mutual recursion (A calls B calls ... calls A).
+
+    Gate counts are computed by fully unrolling the call graph (the same
+    way loops are unrolled by trip count, and branches by max); a cycle in
+    the call graph has no finite unrolling without an explicit recursion-
+    depth bound, which this project does not currently accept as input.
+    Detected by tracking which FuncDefn nodes are on the current walk's
+    call stack and refusing to re-enter one already there, rather than
+    recursing until a Python RecursionError (or worse, looping forever if
+    memoization masked it).
     """
 
 
@@ -141,22 +165,53 @@ def _as_hugr(compiled: Package | Hugr) -> Hugr:
     return compiled
 
 
-def _call_target_name(hugr: Hugr, call_node) -> str:
-    """Best-effort resolution of an ``ops.Call`` node's target FuncDefn
-    name, for a more useful error message. Falls back to a generic
-    description if the target can't be resolved (defensive -- this is only
-    used to make `CallNotSupported`'s message more specific, never load-
-    bearing for correctness)."""
-    try:
-        last_port = hugr.num_in_ports(call_node) - 1
-        (target_out_port,) = hugr.linked_ports(call_node.inp(last_port))
-        target_node = target_out_port.node
-        target_op = hugr[target_node].op
-        if isinstance(target_op, ops.FuncDefn):
-            return f"{target_op.f_name!r} (HUGR node {target_node})"
-        return f"HUGR node {target_node}"
-    except Exception:
-        return "<unresolved>"
+def _resolve_call_target(hugr: Hugr, call_node) -> Node:
+    """Resolves an ``ops.Call`` node to the ``FuncDefn`` node it calls.
+
+    HUGR API, verified by hand against real compiled examples (see
+    CLAUDE.md "Call-following"): ``ops.Call`` connects to its callee via a
+    single static (function-typed) input edge, not a regular dataflow
+    edge. Its port index is not simply "the last input port" (that was an
+    earlier, accidentally-correct-by-coincidence heuristic) -- it is
+    ``Call._function_port_offset()``, which HUGR defines as
+    ``len(call_op.signature.body.input)``: the ordinary dataflow arguments
+    occupy ports ``[0, offset)``, and the function-pointer edge is the one
+    at ``offset``. Confirmed this coincides with "last port" only because
+    ``Call`` has no other port kinds beyond dataflow args + one function
+    pointer -- using the principled offset instead of that coincidence.
+
+    Verified separately (two ``discard_array`` calls on same-size arrays):
+    when the *same* instantiation of a function is called from multiple
+    call sites, all their ``Call`` nodes resolve to the *same* ``FuncDefn``
+    node (guppylang does not duplicate the body per call site) -- this is
+    what makes memoizing a callee's cost by its ``FuncDefn`` node ID both
+    correct and effective. Different instantiations of a generic function
+    (e.g. ``discard_array`` at two different array sizes) DO get distinct
+    ``FuncDefn`` nodes (observed names like ``discard_array$2`` vs.
+    ``discard_array$3``), so this never conflates them.
+
+    Raises ``CallNotSupported`` if the target isn't an ``ops.FuncDefn``
+    (e.g. an ``ops.FuncDecl`` -- an external declaration with no body in
+    this compiled unit to walk at all).
+    """
+    call_op = hugr[call_node].op
+    offset = call_op._function_port_offset()
+    links = list(hugr.linked_ports(call_node.inp(offset)))
+    if len(links) != 1:
+        raise CallNotSupported(
+            f"HUGR node {call_node}'s function-pointer port has {len(links)} "
+            "links (expected exactly 1); cannot resolve the call target."
+        )
+    target_node = links[0].node
+    target_op = hugr[target_node].op
+    if not isinstance(target_op, ops.FuncDefn):
+        raise CallNotSupported(
+            f"HUGR node {call_node} calls {type(target_op).__name__} node "
+            f"{target_node}, not a FuncDefn -- there is no function body "
+            "present in this compiled unit to walk (e.g. an external/opaque "
+            "declaration). Its gates cannot be counted."
+        )
+    return target_node
 
 
 def _classify_ext_op(node, name: str) -> tuple[GateCounts, int]:
@@ -186,46 +241,171 @@ def _classify_ext_op(node, name: str) -> tuple[GateCounts, int]:
     )
 
 
-def _extract_gate_counts_straight_line(hugr: Hugr) -> tuple[GateCounts, int]:
-    t = toffoli = clifford = rotation = measurement = 0
-    n_qubits = 0
+# --- Shared region-cost accumulator and call-following machinery ---
+#
+# Both the straight-line walker (upper_bound=False) and the bounded walker
+# (upper_bound=True) need to: accumulate (GateCounts, n_qubits) over a
+# region, and follow ops.Call edges into a callee's own FuncDefn using the
+# SAME traversal that's walking the caller (so a callee with control flow
+# is bounded/rejected exactly the way it would be if that control flow
+# were written directly at the call site) -- see CLAUDE.md "Call-following"
+# for the full derivation of _resolve_call_target above, and of the
+# design below.
 
-    for node in hugr.descendants(hugr.entrypoint):
-        op = hugr[node].op
+
+@dataclass(frozen=True)
+class _RegionCost:
+    """Accumulated (GateCounts, n_qubits) for one dataflow region."""
+
+    gates: GateCounts
+    n_qubits: int
+
+    def __add__(self, other: "_RegionCost") -> "_RegionCost":
+        return _RegionCost(self.gates + other.gates, self.n_qubits + other.n_qubits)
+
+
+_ZERO_COST = _RegionCost(GateCounts(), 0)
+
+
+def _max_region_cost(a: _RegionCost, b: _RegionCost) -> _RegionCost:
+    """Elementwise max, field by field -- used at branch points, where only
+    one of the alternatives actually executes."""
+    gates = GateCounts(
+        **{f: max(getattr(a.gates, f), getattr(b.gates, f)) for f in _GATE_COUNT_FIELDS}
+    )
+    return _RegionCost(gates, max(a.n_qubits, b.n_qubits))
+
+
+def _reduce_max_region_cost(costs: list[_RegionCost]) -> _RegionCost:
+    return functools.reduce(_max_region_cost, costs)
+
+
+def _scale_gates_only(cost: _RegionCost, n: int) -> _RegionCost:
+    """Multiplies gate counts by a loop trip count, but NOT n_qubits. See
+    the "Bounded" section comment below for why."""
+    return _RegionCost(cost.gates * n, cost.n_qubits)
+
+
+@dataclass(frozen=True)
+class _WalkCtx:
+    """Threaded through every walker function (straight-line and bounded).
+
+    ``loop_trip_counts``: unchanged from before call-following -- a flat
+    dict keyed by a loop header's HUGR node ID. **Design decision on how
+    this composes across call boundaries (see CLAUDE.md "Call-following"
+    for the full reasoning): NOT namespaced per call site.** HUGR node IDs
+    are unique across the *entire* compiled Hugr, not just within one
+    FuncDefn, and a given callee's body is a single shared subtree (see
+    ``_resolve_call_target``'s docstring -- verified by hand that two call
+    sites for the same instantiation resolve to the *same* FuncDefn node),
+    so a loop inside a callee already has one fixed, globally-unique header
+    node ID no matter how many places call it. This is deliberately simple
+    and explicit rather than inventing a per-call-site key scheme: the one
+    real limitation it implies (documented, not hidden) is that if the same
+    callee is invoked from multiple sites and its internal loop should
+    truly run a *different* number of times depending on which site called
+    it (e.g. a trip count that is itself a function of a per-call-site
+    argument), that cannot be expressed -- one node ID, one trip count,
+    applied at every call site that reaches it. What call-following DOES
+    correctly get "for free", with no special-casing needed at all: if the
+    same callee is called once outside a loop and once inside a caller-side
+    loop with its own trip count, the callee's cost is computed ONCE (via
+    ``func_memo``) but ADDED once per call site encountered during the
+    caller's own traversal -- so it naturally picks up whatever multiplier
+    the *caller's* structure applies at each site (1x outside, Nx inside a
+    trip-N loop, max(...) inside a conditional branch), without the
+    call-following code needing to know anything about where it's called
+    from. Verified with a dedicated test, not just reasoned about --  see
+    tests/test_call_following.py.
+
+    ``call_stack``: FuncDefn nodes currently being walked, on the path from
+    the entrypoint down through nested calls (the entrypoint's own FuncDefn
+    is included from the start). A ``Call`` whose target is already in here
+    is a cycle in the call graph -- direct or indirect recursion -- raised
+    as ``RecursiveCallNotSupported`` rather than recursing until Python's
+    own ``RecursionError`` (or, worse, silently looping forever if some
+    future change made this memoize-before-detect).
+
+    ``func_memo``: FuncDefn node -> the _RegionCost of walking it ONCE.
+    Shared (mutated in place) across the whole walk so a callee invoked
+    from multiple call sites is only actually walked once; each call SITE
+    still independently adds a copy of that cost into its own caller's
+    running total (see above) -- memoization avoids recomputation, it does
+    not deduplicate how many times a callee's cost gets counted.
+    """
+
+    loop_trip_counts: dict[int, int]
+    call_stack: frozenset
+    func_memo: dict
+
+    def entering_call(self, target: Node) -> "_WalkCtx":
+        return _WalkCtx(self.loop_trip_counts, self.call_stack | {target}, self.func_memo)
+
+
+def _walk_call(hugr: Hugr, call_node: Node, ctx: _WalkCtx, walk_region) -> _RegionCost:
+    """Shared by both walkers: resolves an ``ops.Call``, detects recursion,
+    consults/populates the memo cache, and returns the cost of ONE
+    execution of the callee -- walked with ``walk_region`` (the caller's
+    own region-walking function), so a straight-line caller's callee is
+    itself required to be straight-line, and a bounded caller's callee
+    gets the full conditional-max / loop-trip-count treatment."""
+    target = _resolve_call_target(hugr, call_node)
+    if target in ctx.call_stack:
+        raise RecursiveCallNotSupported(
+            f"HUGR node {call_node} calls FuncDefn {target}, which is already "
+            "being walked (recursive call graph). Call stack (FuncDefn node "
+            f"IDs): {sorted(n.idx for n in ctx.call_stack)}."
+        )
+    if target in ctx.func_memo:
+        return ctx.func_memo[target]
+    result = walk_region(hugr, target, ctx.entering_call(target))
+    ctx.func_memo[target] = result
+    return result
+
+
+# --- Straight-line (upper_bound=False, the default) gate counting ---
+
+
+def _walk_region_straight_line(hugr: Hugr, container: Node, ctx: _WalkCtx) -> _RegionCost:
+    """Straight-line counterpart to ``_walk_region`` below: walks direct
+    children, following ``Call`` edges (via ``_walk_call``) but raising
+    ``ControlFlowNotSupported`` for any CFG/Conditional/TailLoop found
+    anywhere in the call graph -- a callee with control flow makes the
+    whole program not straight-line, exactly as if that control flow had
+    been written directly at the call site."""
+    cost = _ZERO_COST
+    for child in hugr.children(container):
+        op = hugr[child].op
 
         if isinstance(op, _CONTROL_FLOW_OPS):
             raise ControlFlowNotSupported(
-                f"HUGR node {node} is a {type(op).__name__}: v1 only supports "
+                f"HUGR node {child} is a {type(op).__name__} (reached via the "
+                "call graph starting at the entrypoint): v1 only supports "
                 "straight-line (control-flow-free) guppy programs by default. "
                 "Pass upper_bound=True to estimate()/extract_gate_counts() to "
                 "opt into worst-case bounding instead. See "
                 "CLAUDE.md 'Known limitations' / 'Bounded control flow (opt-in)'."
             )
-
-        if isinstance(op, ops.Call):
+        if isinstance(op, ops.CallIndirect):
             raise CallNotSupported(
-                f"HUGR node {node} calls {_call_target_name(hugr, node)}, which "
-                "was compiled as a separate function rather than inlined. Its "
-                "gates are not counted -- see CallNotSupported's docstring and "
-                "CLAUDE.md 'Real-world stress test' for why this fails loudly "
-                "instead of silently under-counting."
+                f"HUGR node {child} is a CallIndirect: its target is a "
+                "runtime dataflow value, not a fixed function, so there is "
+                "no single body to walk."
             )
-
+        if isinstance(op, ops.Call):
+            cost = cost + _walk_call(hugr, child, ctx, _walk_region_straight_line)
+            continue
         if not isinstance(op, ops.ExtOp):
             continue
+        gates_delta, qubits_delta = _classify_ext_op(child, op.name())
+        cost = cost + _RegionCost(gates_delta, qubits_delta)
+    return cost
 
-        gates_delta, qubits_delta = _classify_ext_op(node, op.name())
-        t += gates_delta.t
-        toffoli += gates_delta.toffoli
-        clifford += gates_delta.clifford
-        rotation += gates_delta.rotation
-        measurement += gates_delta.measurement
-        n_qubits += qubits_delta
 
-    gate_counts = GateCounts(
-        t=t, toffoli=toffoli, clifford=clifford, rotation=rotation, measurement=measurement
-    )
-    return gate_counts, n_qubits
+def _extract_gate_counts_straight_line(hugr: Hugr) -> tuple[GateCounts, int]:
+    ctx = _WalkCtx(loop_trip_counts={}, call_stack=frozenset({hugr.entrypoint}), func_memo={})
+    cost = _walk_region_straight_line(hugr, hugr.entrypoint, ctx)
+    return cost.gates, cost.n_qubits
 
 
 # --- Bounded (upper_bound=True) control-flow-aware gate counting ---
@@ -268,39 +448,6 @@ def _extract_gate_counts_straight_line(hugr: Hugr) -> tuple[GateCounts, int]:
 # slot across iterations rather than needing trip_count distinct ones.
 
 
-@dataclass(frozen=True)
-class _RegionCost:
-    """Accumulated (GateCounts, n_qubits) for one dataflow region."""
-
-    gates: GateCounts
-    n_qubits: int
-
-    def __add__(self, other: "_RegionCost") -> "_RegionCost":
-        return _RegionCost(self.gates + other.gates, self.n_qubits + other.n_qubits)
-
-
-_ZERO_COST = _RegionCost(GateCounts(), 0)
-
-
-def _max_region_cost(a: _RegionCost, b: _RegionCost) -> _RegionCost:
-    """Elementwise max, field by field -- used at branch points, where only
-    one of the alternatives actually executes."""
-    gates = GateCounts(
-        **{f: max(getattr(a.gates, f), getattr(b.gates, f)) for f in _GATE_COUNT_FIELDS}
-    )
-    return _RegionCost(gates, max(a.n_qubits, b.n_qubits))
-
-
-def _reduce_max_region_cost(costs: list[_RegionCost]) -> _RegionCost:
-    return functools.reduce(_max_region_cost, costs)
-
-
-def _scale_gates_only(cost: _RegionCost, n: int) -> _RegionCost:
-    """Multiplies gate counts by a loop trip count, but NOT n_qubits. See
-    the module-level comment above this section for why."""
-    return _RegionCost(cost.gates * n, cost.n_qubits)
-
-
 def _get_trip_count(header: Node, loop_trip_counts: dict[int, int]) -> int:
     key = header.idx
     if key not in loop_trip_counts:
@@ -318,10 +465,10 @@ def _get_trip_count(header: Node, loop_trip_counts: dict[int, int]) -> int:
     return trip_count
 
 
-def _walk_region(hugr: Hugr, container: Node, loop_trip_counts: dict[int, int]) -> _RegionCost:
+def _walk_region(hugr: Hugr, container: Node, ctx: _WalkCtx) -> _RegionCost:
     """Walks the direct children of a dataflow container node (a FuncDefn,
     DataflowBlock, or Case body), accumulating gate counts. Recurses
-    specially into any CFG/Conditional/TailLoop child. Non-tket ExtOps
+    specially into any CFG/Conditional/TailLoop/Call child. Non-tket ExtOps
     (e.g. `arithmetic.int.*`, `prelude.panic` -- classical loop-condition
     and iterator-protocol bookkeeping, only ever encountered here, never in
     straight-line code) are skipped: they are not quantum gates, so they
@@ -331,9 +478,9 @@ def _walk_region(hugr: Hugr, container: Node, loop_trip_counts: dict[int, int]) 
         op = hugr[child].op
 
         if isinstance(op, ops.CFG):
-            cost = cost + _walk_cfg(hugr, child, loop_trip_counts)
+            cost = cost + _walk_cfg(hugr, child, ctx)
         elif isinstance(op, ops.Conditional):
-            cost = cost + _walk_conditional(hugr, child, loop_trip_counts)
+            cost = cost + _walk_conditional(hugr, child, ctx)
         elif isinstance(op, ops.TailLoop):
             raise UnsupportedControlFlowShape(
                 f"HUGR node {child} is a TailLoop, which upper_bound mode does "
@@ -346,14 +493,14 @@ def _walk_region(hugr: Hugr, container: Node, loop_trip_counts: dict[int, int]) 
                 "needs hand-verification against a real TailLoop example before "
                 "adding support, not a guess."
             )
-        elif isinstance(op, ops.Call):
+        elif isinstance(op, ops.CallIndirect):
             raise CallNotSupported(
-                f"HUGR node {child} calls {_call_target_name(hugr, child)}, "
-                "which was compiled as a separate function rather than "
-                "inlined. Its gates are not counted -- see CallNotSupported's "
-                "docstring and CLAUDE.md 'Real-world stress test' for why this "
-                "fails loudly instead of silently under-counting."
+                f"HUGR node {child} is a CallIndirect: its target is a "
+                "runtime dataflow value, not a fixed function, so there is "
+                "no single body to walk."
             )
+        elif isinstance(op, ops.Call):
+            cost = cost + _walk_call(hugr, child, ctx, _walk_region)
         elif isinstance(op, ops.ExtOp):
             name = op.name()
             if not name.startswith("tket."):
@@ -366,9 +513,9 @@ def _walk_region(hugr: Hugr, container: Node, loop_trip_counts: dict[int, int]) 
     return cost
 
 
-def _walk_conditional(hugr: Hugr, cond_node: Node, loop_trip_counts: dict[int, int]) -> _RegionCost:
+def _walk_conditional(hugr: Hugr, cond_node: Node, ctx: _WalkCtx) -> _RegionCost:
     """A Conditional's children are all Case nodes -- exactly one runs."""
-    case_costs = [_walk_region(hugr, case, loop_trip_counts) for case in hugr.children(cond_node)]
+    case_costs = [_walk_region(hugr, case, ctx) for case in hugr.children(cond_node)]
     return _reduce_max_region_cost(case_costs)
 
 
@@ -388,7 +535,7 @@ def _natural_loop_nodes(header: Node, back_edge_source: Node, pred: dict[Node, l
     return loop_nodes
 
 
-def _walk_cfg(hugr: Hugr, cfg_node: Node, loop_trip_counts: dict[int, int]) -> _RegionCost:
+def _walk_cfg(hugr: Hugr, cfg_node: Node, ctx: _WalkCtx) -> _RegionCost:
     blocks = list(hugr.children(cfg_node))
     if not blocks:
         raise UnsupportedControlFlowShape(f"CFG at node {cfg_node} has no children")
@@ -460,7 +607,7 @@ def _walk_cfg(hugr: Hugr, cfg_node: Node, loop_trip_counts: dict[int, int]) -> _
                     )
         headers[v] = (into_loop[0], out_of_loop[0], loop_nodes)
 
-    own_cost = {b: _walk_region(hugr, b, loop_trip_counts) for b in blocks}
+    own_cost = {b: _walk_region(hugr, b, ctx) for b in blocks}
     memo: dict[Node, _RegionCost] = {}
     memo_within: dict[tuple[Node, Node], _RegionCost] = {}
 
@@ -491,7 +638,7 @@ def _walk_cfg(hugr: Hugr, cfg_node: Node, loop_trip_counts: dict[int, int]) -> _
 
         if node in headers and node != stop_header:
             entry_succ, exit_succ, _inner_loop_nodes = headers[node]
-            inner_trip_count = _get_trip_count(node, loop_trip_counts)
+            inner_trip_count = _get_trip_count(node, ctx.loop_trip_counts)
             inner_body_once = dp_within(entry_succ, node)
             result = (
                 _scale_gates_only(own_cost[node], inner_trip_count + 1)
@@ -517,7 +664,7 @@ def _walk_cfg(hugr: Hugr, cfg_node: Node, loop_trip_counts: dict[int, int]) -> _
             return memo[node]
         if node in headers:
             entry_succ, exit_succ, _loop_nodes = headers[node]
-            trip_count = _get_trip_count(node, loop_trip_counts)
+            trip_count = _get_trip_count(node, ctx.loop_trip_counts)
             body_once = dp_within(entry_succ, node)
             result = (
                 _scale_gates_only(own_cost[node], trip_count + 1)
@@ -566,21 +713,39 @@ def extract_gate_counts(
     should treat it and any downstream ``estimate()`` numbers accordingly
     (``EstimateResult.is_upper_bound`` / its printed output says so).
 
+    Both modes follow calls to other guppy functions (inlined or not),
+    walking the callee's body with the same rules as the caller -- see
+    CLAUDE.md "Call-following" for exactly how a callee's own loops/
+    conditionals compose with the caller's (short version: a callee's loop
+    trip count is keyed the same way as any other loop, by its header's
+    node ID, regardless of how many places call it; a callee invoked
+    inside a caller-side loop has its cost picked up by that loop's trip
+    count automatically, with no special-casing needed).
+
     Raises:
-        ControlFlowNotSupported: control flow present and ``upper_bound``
-            is False.
+        ControlFlowNotSupported: control flow present (in the program or
+            anything it calls) and ``upper_bound`` is False.
         UnrecognizedGate: a quantum op has no known GateCounts bucket.
-        LoopTripCountMissing: ``upper_bound=True`` and a loop's header has
-            no entry in ``loop_trip_counts``.
-        UnsupportedControlFlowShape: ``upper_bound=True`` and the CFG has a
-            shape not hand-verified as boundable (see the class docstring).
-        CallNotSupported: the program calls a function that was compiled
-            separately rather than inlined -- its gates cannot currently be
-            seen or counted at all (see the class docstring; this is a real
-            gap found via a real-world stress test, not a hypothetical).
+        LoopTripCountMissing: ``upper_bound=True`` and a loop's header (in
+            the program or anything it calls) has no entry in
+            ``loop_trip_counts``.
+        UnsupportedControlFlowShape: ``upper_bound=True`` and a CFG (in the
+            program or anything it calls) has a shape not hand-verified as
+            boundable (see the class docstring).
+        CallNotSupported: a call cannot be resolved to a walkable function
+            body at all (a ``CallIndirect``, or a ``Call`` targeting a
+            ``FuncDecl`` with no body in this compiled unit) -- see the
+            class docstring for how this differs from before 2026-09-05.
+        RecursiveCallNotSupported: the call graph contains a cycle (direct
+            or indirect recursion) -- see the class docstring.
     """
     hugr = _as_hugr(compiled)
     if not upper_bound:
         return _extract_gate_counts_straight_line(hugr)
-    cost = _walk_region(hugr, hugr.entrypoint, loop_trip_counts or {})
+    ctx = _WalkCtx(
+        loop_trip_counts=loop_trip_counts or {},
+        call_stack=frozenset({hugr.entrypoint}),
+        func_memo={},
+    )
+    cost = _walk_region(hugr, hugr.entrypoint, ctx)
     return cost.gates, cost.n_qubits

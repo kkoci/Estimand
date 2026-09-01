@@ -3,6 +3,7 @@ from guppy_estimand.gate_counts import (
     CallNotSupported,
     ControlFlowNotSupported,
     LoopTripCountMissing,
+    RecursiveCallNotSupported,
     UnrecognizedGate,
     UnsupportedControlFlowShape,
     extract_gate_counts,
@@ -17,4 +18,5 @@ __all__ = [
     "LoopTripCountMissing",
     "UnsupportedControlFlowShape",
     "CallNotSupported",
+    "RecursiveCallNotSupported",
 ]
