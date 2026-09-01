@@ -178,13 +178,15 @@ against your program's actual runtime behavior.
   reducible to a 2-Case continue/break `Conditional` feeding the loop's
   own output directly) still raises `UnsupportedControlFlowShape`.
 - **Calling another function is now followed and walked**, not refused —
-  see "Call-following" below. `CallNotSupported` still exists, narrowed to
-  the genuinely irresolvable case: a call whose target isn't statically
-  known (`CallIndirect`) or resolves to a body-less external declaration
-  (`FuncDecl`). **`CallIndirect` is not just a hypothetical** — confirmed
-  reachable from real qshelf code (Grover's `with control(...): x(...)`
-  modifier compiles to one), so a real program can still hit
-  `CallNotSupported` today; see "Real-world stress test" below. A
+  see "Call-following" below. **A `CallIndirect` whose target is
+  statically resolvable is now followed too** — see "CallIndirect
+  support" below; this covers `with control(...): x(...)` (guppy's
+  controlled-operation modifier), confirmed reachable from real qshelf
+  code (Grover uses it throughout). `CallNotSupported` still exists,
+  narrowed further to the genuinely irresolvable case: a `CallIndirect`
+  whose target is a real runtime-chosen function value (not just
+  hypothetical either — see "CallIndirect support"), or a `Call`
+  resolving to a body-less external declaration (`FuncDecl`). A
   *recursive* call graph (direct or indirect) is detected and refused
   loudly as `RecursiveCallNotSupported`, rather than looping forever or
   guessing a bound.
@@ -258,6 +260,25 @@ linear typing forces the whole array to be freed (e.g. via
 scaling and the *outer* while-loop's non-scaling both apply, correctly,
 without conflicting.
 
+## CallIndirect support
+
+`with control(q0, q1): x(q2)` (guppy's controlled-operation modifier, used
+throughout qshelf's Grover package) compiles to a `LoadFunc` + a
+`CallIndirect` node — a call through a loaded function *value*, not a
+static `Call` edge. `estimate()`/`extract_gate_counts()` now resolve this:
+when a `CallIndirect`'s function operand traces back through a `LoadFunc`
+to a known `FuncDefn`, it's followed and walked exactly like an ordinary
+`Call` (same recursion detection, same memoization — see "Call-following"
+above). See `CLAUDE.md` "CallIndirect support" for the full hand-verified
+`LoadFunc`/`CallIndirect` wiring.
+
+This is a general pattern, not a `control(...)`-specific special case —
+verified by also constructing a genuinely dynamic case (a function value
+chosen at runtime via a real `if`/`else`, not a compile-time-fixed
+target), confirming it still correctly raises `CallNotSupported`: there's
+no statically fixed body to walk, and guessing one would silently produce
+a wrong number rather than an honest refusal.
+
 ## Real-world stress test: QFT (and Grover) from kkoci/Qshelf
 
 `bell_and_t` above is a hand-written toy. [`examples/qft_n.py`](./examples/qft_n.py)
@@ -278,12 +299,23 @@ writeup; summary:
 - **Also checked, as requested: Grover.** Its premise didn't hold up under
   verification — `grover_search`'s iteration count is a compile-time `nat`
   generic parameter, exactly like QFT's register size, not a genuinely
-  runtime-dependent value. Grover currently can't be estimated at all, but
+  runtime-dependent value. Grover initially couldn't be estimated at all,
   for an unrelated reason found along the way: its `with control(q0, q1):
   x(q2)` modifier compiles to a `CallIndirect` node — confirming
-  `CallIndirect` is a real, reachable case for `CallNotSupported`, not
-  just the defensive/untested one it was believed to be. Not fixed in this
-  pass; see `CLAUDE.md` "Possible future work".
+  `CallIndirect` was a real, reachable case, not just the
+  defensive/untested one it was believed to be.
+- **Grover now works too — see "CallIndirect support" above.**
+  [`examples/grover_n.py`](./examples/grover_n.py) runs qshelf's Grover
+  completely unmodified: real `with control(...):` usage in both `oracle`
+  and `diffuser`, composed with 8 distinct loop trip counts (register
+  allocation, `discard_array`, four loops inside `diffuser`, and
+  `grover_search`'s own register-prep loop plus its real
+  `iterations`-count loop — the latter two distinguished empirically, not
+  by guessing; see `CLAUDE.md`). For `N=8` items, 1 marked (`marked=5`),
+  optimal `iterations=2`: `toffoli: 4, clifford: 47` — hand-verified by
+  independently isolating `oracle[5]` (`toffoli: 1, clifford: 8`) and
+  `diffuser` (`toffoli: 1, clifford: 14`) and confirming
+  `3 + 2×(8+14) = 47` clifford, `2×(1+1) = 4` toffoli exactly.
 
 Actual output (`python examples/qft_n.py`, guppylang 1.0.2 / qualtran 0.7.0):
 
@@ -323,11 +355,27 @@ guppy-estimand result (scheme=beverland, code distance d=17)
 (n=3 and n=5 omitted above for brevity — see the file for the full
 `n=2..6` sweep; every size matches the closed-form formula above exactly.)
 
+Actual output (`python examples/grover_n.py`, guppylang 1.0.2 / qualtran 0.7.0):
+
+```
+=== Grover's algorithm, N=8, marked=5, iterations=2 ===
+fully idiomatic qshelf source (incl. `with control(...):`), zero workarounds
+guppy-estimand result (scheme=beverland, code distance d=17)
+  *** UPPER BOUND -- NOT a point estimate (upper_bound=True) ***
+  logical qubits:    3
+  logical gates:     toffoli: 4, clifford: 47
+  physical qubits:   5,770  (upper bound)
+  runtime:           6.800e-08 hours  (upper bound)
+  total error:       3.255e-04  (upper bound)
+  ...
+```
+
 ## Project layout
 
 - `src/guppy_estimand/gate_counts.py` — HUGR walker: compiled guppy program → Qualtran `GateCounts`.
 - `src/guppy_estimand/estimate.py` — `GateCounts` → Qualtran `PhysicalCostModel` → `EstimateResult`.
 - `examples/` — runnable guppy programs with expected output, including
-  `qft_n.py` (real-world stress test, see above) and `_qshelf_qft.py` (the
-  minimal vendored source it depends on, from kkoci/Qshelf).
+  `qft_n.py` / `_qshelf_qft.py` and `grover_n.py` / `_qshelf_grover.py`
+  (real-world stress tests, see above, each with its minimal vendored
+  source from kkoci/Qshelf).
 - `tests/` — unit tests, including a hand-verified numeric example.

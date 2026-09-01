@@ -123,17 +123,27 @@ class CallNotSupported(NotImplementedError):
     now follow ``ops.Call`` edges into the callee's own ``FuncDefn`` and
     walk its body with the same traversal used for the caller -- so a call
     to an ordinary, defined guppy function (inlined or not) is no longer
-    what raises this. It is now raised only for a call this project
-    genuinely cannot resolve to a body to walk:
+    what raises this.
 
-    - ``ops.CallIndirect`` -- the target is a runtime dataflow value (e.g.
-      a function passed as a first-class value), not a static edge to a
-      known ``FuncDefn``, so there is nothing fixed to walk.
-    - A ``Call`` whose static function-pointer edge resolves to an
-      ``ops.FuncDecl`` (or anything other than ``ops.FuncDefn``) -- a
-      ``FuncDecl`` is an external/opaque function declaration with no
-      body present in this compiled unit at all (e.g. an extern), so
-      there is nothing to walk regardless of how hard this project looks.
+    **Narrowed further 2026-09-07** (see CLAUDE.md "CallIndirect
+    support"): ``ops.CallIndirect`` is also now followed, when its
+    function operand traces to an ``ops.LoadFunc`` node with a statically
+    known target -- confirmed to be the case for guppy's ``with
+    control(...):`` modifier (verified against qshelf's Grover package,
+    where it was found to be a real, reachable case, not a hypothetical
+    one). It is now raised only for a call this project genuinely cannot
+    resolve to a body to walk:
+
+    - ``ops.CallIndirect`` whose function operand does NOT come from a
+      ``LoadFunc`` -- i.e. a genuinely dynamic function value (chosen at
+      runtime, e.g. via a conditional, or received as a parameter), with
+      no static target to trace at all.
+    - A ``Call`` (or a ``CallIndirect``'s resolved ``LoadFunc``) whose
+      static function-pointer edge resolves to an ``ops.FuncDecl`` (or
+      anything other than ``ops.FuncDefn``) -- a ``FuncDecl`` is an
+      external/opaque function declaration with no body present in this
+      compiled unit at all (e.g. an extern), so there is nothing to walk
+      regardless of how hard this project looks.
 
     Previously (before 2026-09-05) this was raised for *every* call to a
     non-inlined function, which is not a hypothetical gap: guppylang 1.0.2
@@ -143,8 +153,8 @@ class CallNotSupported(NotImplementedError):
     qubits) as separate, called functions -- and before any fix, their
     gates were silently invisible, with no error, undercounting real
     programs down to near-zero. That silent-undercount failure mode no
-    longer exists for a resolvable ``Call``; only genuinely irresolvable
-    calls raise this now.
+    longer exists for a resolvable ``Call`` or ``CallIndirect``; only
+    genuinely irresolvable calls raise this now.
     """
 
 
@@ -219,6 +229,79 @@ def _resolve_call_target(hugr: Hugr, call_node) -> Node:
             f"{target_node}, not a FuncDefn -- there is no function body "
             "present in this compiled unit to walk (e.g. an external/opaque "
             "declaration). Its gates cannot be counted."
+        )
+    return target_node
+
+
+def _resolve_call_indirect_target(hugr: Hugr, call_indirect_node) -> Node:
+    """Resolves an ``ops.CallIndirect`` node to the ``FuncDefn`` it calls,
+    when possible -- added 2026-09-07, see CLAUDE.md "CallIndirect
+    support" for the full derivation.
+
+    ``CallIndirect``'s function-being-called is a REGULAR dataflow input
+    (per its own ``_inputs()``: ``[sig, *sig.input]`` -- port 0 is always
+    the function value, ports 1+ are the ordinary call arguments), unlike
+    ``Call``'s static function-pointer edge. In general this makes
+    ``CallIndirect`` genuinely dynamic: the function value at port 0 could
+    come from anywhere (a parameter, a value chosen by a conditional,
+    etc.), with no guarantee it traces back to anything statically known.
+
+    BUT: verified by hand against a real compiled example (guppy's
+    ``with control(q0, q1): x(q2)`` modifier, used throughout qshelf's
+    Grover package) that when the port-0 source is specifically an
+    ``ops.LoadFunc`` node, the callee IS statically fixed --
+    ``ops.LoadFunc``'s own docstring states it loads a "statically defined
+    function" via a static edge (its own port 0, always -- `LoadFunc` has
+    zero ordinary dataflow inputs, so there's no offset computation needed
+    the way ``Call._function_port_offset()`` needed one). Confirmed by
+    tracing the actual wiring: ``CallIndirect``'s port-0 source was
+    directly (zero intermediate ops) a ``LoadFunc`` node, whose own port-0
+    source was directly a ``FuncDefn`` -- not a hardcoded pattern-match on
+    the ``control(...)`` syntax specifically, just checking "does this
+    CallIndirect's function operand come from a LoadFunc" in general,
+    which is a real, principled HUGR pattern (LoadFunc's whole purpose is
+    loading a *known* function as a first-class value) rather than
+    something specific to how guppy happens to compile ``control(...)``.
+
+    Raises ``CallNotSupported`` if the port-0 source is not an
+    ``ops.LoadFunc`` (a genuinely dynamic function value -- e.g. one
+    selected at runtime, or received as a parameter) or if the
+    ``LoadFunc``'s own target isn't an ``ops.FuncDefn`` (e.g. a
+    ``FuncDecl``, same as for ``Call``).
+    """
+    links = list(hugr.linked_ports(call_indirect_node.inp(0)))
+    if len(links) != 1:
+        raise CallNotSupported(
+            f"HUGR node {call_indirect_node}'s function-value port (0) has "
+            f"{len(links)} links (expected exactly 1); cannot resolve the "
+            "call target."
+        )
+    source_node = links[0].node
+    source_op = hugr[source_node].op
+    if not isinstance(source_op, ops.LoadFunc):
+        raise CallNotSupported(
+            f"HUGR node {call_indirect_node}'s function value comes from "
+            f"{type(source_op).__name__} node {source_node}, not a LoadFunc "
+            "-- its target is a genuinely dynamic function value (e.g. "
+            "chosen at runtime, or received as a parameter), not something "
+            "statically fixed this project can trace to a body to walk."
+        )
+    func_links = list(hugr.linked_ports(source_node.inp(0)))
+    if len(func_links) != 1:
+        raise CallNotSupported(
+            f"HUGR node {source_node} (LoadFunc)'s function-pointer port (0) "
+            f"has {len(func_links)} links (expected exactly 1); cannot "
+            "resolve the call target."
+        )
+    target_node = func_links[0].node
+    target_op = hugr[target_node].op
+    if not isinstance(target_op, ops.FuncDefn):
+        raise CallNotSupported(
+            f"HUGR node {call_indirect_node} calls (via LoadFunc {source_node}) "
+            f"{type(target_op).__name__} node {target_node}, not a FuncDefn "
+            "-- there is no function body present in this compiled unit to "
+            "walk (e.g. an external/opaque declaration). Its gates cannot "
+            "be counted."
         )
     return target_node
 
@@ -366,25 +449,46 @@ class _WalkCtx:
         return _WalkCtx(self.loop_trip_counts, self.call_stack | {target}, self.func_memo)
 
 
-def _walk_call(hugr: Hugr, call_node: Node, ctx: _WalkCtx, walk_region) -> _RegionCost:
-    """Shared by both walkers: resolves an ``ops.Call``, detects recursion,
-    consults/populates the memo cache, and returns the cost of ONE
-    execution of the callee -- walked with ``walk_region`` (the caller's
-    own region-walking function), so a straight-line caller's callee is
-    itself required to be straight-line, and a bounded caller's callee
-    gets the full conditional-max / loop-trip-count treatment."""
-    target = _resolve_call_target(hugr, call_node)
+def _walk_resolved_call(
+    hugr: Hugr, calling_node: Node, target: Node, ctx: _WalkCtx, walk_region
+) -> _RegionCost:
+    """Shared core of ``_walk_call``/``_walk_call_indirect``: given an
+    ALREADY-RESOLVED target ``FuncDefn`` (however it was resolved -- a
+    ``Call``'s static edge, or a ``CallIndirect``'s LoadFunc chain),
+    detects recursion, consults/populates the memo cache, and returns the
+    cost of ONE execution of the callee -- walked with ``walk_region``
+    (the caller's own region-walking function), so a straight-line
+    caller's callee is itself required to be straight-line, and a bounded
+    caller's callee gets the full conditional-max / loop-trip-count
+    treatment. Factored out (2026-09-07) so ``ops.Call`` and the now-
+    resolvable subset of ``ops.CallIndirect`` share this rather than
+    duplicating the cycle-check/memoization logic."""
     if target in ctx.call_stack:
         raise RecursiveCallNotSupported(
-            f"HUGR node {call_node} calls FuncDefn {target}, which is already "
-            "being walked (recursive call graph). Call stack (FuncDefn node "
-            f"IDs): {sorted(n.idx for n in ctx.call_stack)}."
+            f"HUGR node {calling_node} calls FuncDefn {target}, which is "
+            "already being walked (recursive call graph). Call stack "
+            f"(FuncDefn node IDs): {sorted(n.idx for n in ctx.call_stack)}."
         )
     if target in ctx.func_memo:
         return ctx.func_memo[target]
     result = walk_region(hugr, target, ctx.entering_call(target))
     ctx.func_memo[target] = result
     return result
+
+
+def _walk_call(hugr: Hugr, call_node: Node, ctx: _WalkCtx, walk_region) -> _RegionCost:
+    """Resolves an ``ops.Call`` and walks it -- see ``_walk_resolved_call``."""
+    target = _resolve_call_target(hugr, call_node)
+    return _walk_resolved_call(hugr, call_node, target, ctx, walk_region)
+
+
+def _walk_call_indirect(hugr: Hugr, call_indirect_node: Node, ctx: _WalkCtx, walk_region) -> _RegionCost:
+    """Resolves an ``ops.CallIndirect`` (via ``_resolve_call_indirect_target``
+    -- only when its function operand traces to a ``LoadFunc``, see that
+    function's docstring and CLAUDE.md "CallIndirect support") and walks
+    it -- see ``_walk_resolved_call``."""
+    target = _resolve_call_indirect_target(hugr, call_indirect_node)
+    return _walk_resolved_call(hugr, call_indirect_node, target, ctx, walk_region)
 
 
 # --- Straight-line (upper_bound=False, the default) gate counting ---
@@ -411,11 +515,8 @@ def _walk_region_straight_line(hugr: Hugr, container: Node, ctx: _WalkCtx) -> _R
                 "CLAUDE.md 'Known limitations' / 'Bounded control flow (opt-in)'."
             )
         if isinstance(op, ops.CallIndirect):
-            raise CallNotSupported(
-                f"HUGR node {child} is a CallIndirect: its target is a "
-                "runtime dataflow value, not a fixed function, so there is "
-                "no single body to walk."
-            )
+            cost = cost + _walk_call_indirect(hugr, child, ctx, _walk_region_straight_line)
+            continue
         if isinstance(op, ops.Call):
             cost = cost + _walk_call(hugr, child, ctx, _walk_region_straight_line)
             continue
@@ -508,11 +609,7 @@ def _walk_child(hugr: Hugr, child: Node, ctx: _WalkCtx) -> _RegionCost:
     if isinstance(op, ops.TailLoop):
         return _walk_tail_loop(hugr, child, ctx)
     if isinstance(op, ops.CallIndirect):
-        raise CallNotSupported(
-            f"HUGR node {child} is a CallIndirect: its target is a "
-            "runtime dataflow value, not a fixed function, so there is "
-            "no single body to walk."
-        )
+        return _walk_call_indirect(hugr, child, ctx, _walk_region)
     if isinstance(op, ops.Call):
         return _walk_call(hugr, child, ctx, _walk_region)
     if isinstance(op, ops.ExtOp):

@@ -455,6 +455,22 @@ found and fixed, not just confirmed-correct-by-luck:**
   function was worth checking explicitly rather than assuming they don't
   interfere with each other.
 
+- **`ops.CallIndirect`'s function operand is always port 0** — confirmed
+  via `inspect.getsource` on `hugr.ops.CallIndirect._inputs()`, which
+  returns `[sig, *sig.input]` (the function-value type always comes
+  first). This is unlike `ops.Call`, whose function-pointer port is
+  computed by `_function_port_offset()` and isn't fixed at 0 in general.
+  **`ops.LoadFunc` loads a statically-defined function via a static edge,
+  also always at port 0.** Verified directly: for `with control(q0, q1):
+  x(q2)` (guppy's controlled-operation modifier), `CallIndirect.inp(0)`'s
+  single linked source is *directly* a `LoadFunc` node (zero intermediate
+  nodes), and that `LoadFunc.inp(0)`'s single linked source is *directly*
+  the target `FuncDefn` — for `control`, an auto-generated function named
+  like `__modified__<caller>.__WithBlock__0`. Full derivation, including a
+  real constructed counterexample where this chain leads to a `CFG`
+  instead (a genuinely runtime-chosen function value) rather than a
+  `LoadFunc`, in "CallIndirect support" below.
+
 ## Known limitations (see README for the user-facing version)
 
 - Straight-line (control-flow-free) guppy programs only, by default. See
@@ -740,7 +756,9 @@ exist as HUGR concepts. Neither was ever observed produced by any guppy
 source pattern tried in this project — `CallNotSupported` is narrowed to
 cover them as a documented, defensive case, not something independently
 reproduced from real guppy code (see "What's not independently verified"
-below).
+below). **(Update, 2026-09-07: `CallIndirect` was subsequently confirmed
+reachable from real code, and partially resolved — see "CallIndirect
+support" below. `ops.FuncDecl` remains an unreproduced, defensive case.)**
 
 `_as_hugr` still rejects multi-module `Package`s outright (unchanged,
 pre-existing behavior), so whether a `Call` could ever target a `FuncDefn`
@@ -848,7 +866,11 @@ known guppy source pattern that produces them — `tests/test_call_following.py:
 is a smoke test that the exception class and its docstring exist, not a
 HUGR-level repro of triggering either code path. Documented as an honest
 gap rather than a fabricated test asserting behavior nobody has actually
-exercised.
+exercised. **(Update, 2026-09-07: `CallIndirect` now has real repros in
+both directions — a resolvable one (`with control(...):`) and a
+genuinely-irresolvable one (a runtime-chosen function value) — see
+"CallIndirect support" below and `tests/test_call_indirect.py`. `Call`
+targeting a bare `FuncDecl` remains unreproduced.)**
 
 **Step 5 — re-running the qshelf QFT stress test, full honest result.**
 Swept `n = 2..6` again (same registers as the original inlining-threshold
@@ -1089,6 +1111,165 @@ faked) delivered a different kind of value: it corrected a wrong premise
 previously-unconfirmed gap (`CallIndirect`) that this pass did not set out
 to fix and did not force a fit for.
 
+## CallIndirect support (2026-09-07)
+
+Followed directly from the "TailLoop support" pass above, which found that
+qshelf's Grover package hits `CallNotSupported` on a `CallIndirect` node
+before ever reaching `grover_search`'s own body — `with control(q0, q1):
+x(q2)` (guppy's controlled-operation modifier, used throughout `oracle`
+and `diffuser`) compiles to a `LoadFunc` + `CallIndirect` pair, not a
+static `Call` edge. Task: investigate whether that's tractable to resolve
+in general, not just for the `control(...)` pattern specifically.
+
+**Step 1 — inspect the actual `LoadFunc`/`CallIndirect` structure by
+hand.** Compiled a minimal `with control(q0, q1): x(q2)` repro and traced
+its wiring directly (`hugr.linked_ports`, not assumed):
+- `ops.CallIndirect`'s function operand is **always port 0** — confirmed
+  via `inspect.getsource` on `hugr.ops.CallIndirect._inputs()`, which
+  returns `[sig, *sig.input]` (the function-value type first, always).
+  This is unlike `ops.Call`, whose function-pointer port position is
+  computed by `_function_port_offset()` and can vary.
+- `ops.LoadFunc` loads a **statically defined function** via a static
+  edge, always at port 0 too (confirmed the same way).
+- For the minimal repro, `CallIndirect.inp(0)`'s single linked source is
+  **directly** (zero intermediate nodes) a `LoadFunc` node, and that
+  `LoadFunc.inp(0)`'s single linked source is **directly** a `FuncDefn` —
+  specifically an auto-generated one named like
+  `__modified__<caller>.__WithBlock__0`, whose entire body (for 2 controls
+  + an `x` target) is a single `tket.quantum.Toffoli` op. Already covered
+  by the existing `_TOFFOLI` classification table — no new gate
+  classification needed, only the call-resolution machinery.
+
+**Step 2 — check whether this is general or `control(...)`-specific.**
+Deliberately tried to construct a *genuinely* dynamic `CallIndirect` (a
+function value chosen at runtime, not statically fixed) to find the real
+boundary, hitting several real guppy syntax dead ends along the way (kept
+here since they're non-obvious and easy to re-hit):
+- A bare parameter pass-through (`def call_it(f, q): f(q)`) needs an
+  explicit `guppylang.std.builtins.Function[[qubit], None]` annotation —
+  guppy doesn't infer a callable parameter's type. Even then, this case
+  resolves statically anyway (the compiler traces the actual argument at
+  each call site back to a `LoadFunc`) — not itself a counterexample.
+- `f: Function[[qubit], None] = apply_h if b else apply_x` (ternary) →
+  "Expression may refer to different types" — guppy requires each branch
+  to independently coerce to the declared `Function[...]` type.
+- `f: Function[[qubit], None]` (bare pre-declaration, then assigned in an
+  `if`/`else`) → "Variable declarations are not supported" — guppy has no
+  declare-then-assign pattern.
+- Restructuring as a helper `choose(b: bool) -> Function[[qubit], None]:
+  if b: return apply_h else: return apply_x`, called via `f =
+  choose(measure(ctrl).read()); f(q)`, finally produced a genuinely
+  dynamic case — `measure(...)` returns `Measurement`, not `bool`
+  (`Expected argument of type 'bool', got 'Measurement'`), fixed by
+  calling `.read()` (found via `inspect.getsource` on
+  `guppylang.std.quantum.Measurement`).
+- Traced this case's `CallIndirect.inp(0)`: its source is a **`CFG`**
+  node (the compiled `if`/`else`), not a `LoadFunc`. This confirms the
+  real dividing line is exactly "does `CallIndirect`'s function operand
+  trace to a `LoadFunc`" — a general, principled HUGR pattern, not a
+  `control(...)`-specific special case. (It's a broader win than expected:
+  since the compiler appears to eagerly resolve to `LoadFunc` whenever a
+  target is statically determinable at all, this general check likely
+  covers other higher-order-function patterns too, not just `control`.)
+
+**Step 3 — implementation.** Added `_resolve_call_indirect_target`
+(`src/guppy_estimand/gate_counts.py`), mirroring `_resolve_call_target`:
+follows `CallIndirect.inp(0)` to its source; if that source isn't a
+`LoadFunc`, raises `CallNotSupported` (case confirmed reachable in step 2
+above, message says so explicitly); otherwise follows the `LoadFunc`'s own
+`inp(0)` to its source, requiring a `FuncDefn` (raising `CallNotSupported`
+again if not — e.g. a `FuncDecl`, an external/opaque declaration with no
+body to walk). Refactored the cycle-detection + memoization core shared by
+`_walk_call` (the `ops.Call` case) into `_walk_resolved_call`, so
+`_walk_call_indirect` reuses it rather than duplicating recursion/memo
+logic — same `call_stack`/`func_memo` semantics apply uniformly to both
+`Call` and `CallIndirect` once a target is known. Both `CallIndirect`
+dispatch sites (`_walk_region_straight_line`, `_walk_child`) now call
+`_walk_call_indirect` instead of unconditionally raising.
+
+**Step 4 — verification.** Full existing 39-test suite passed unchanged
+(no regression). Minimal `control(q0, q1): x(q2)` repro now gives
+`toffoli: 1, n_qubits: 3` in bounded mode, matching the hand-derived
+expectation exactly. The genuinely-dynamic case from step 2 still
+correctly raises `CallNotSupported` (`"...not a LoadFunc -- its target is
+a genuinely dynamic function value..."`), confirming the boundary holds in
+both directions. Both cases are now permanent tests —
+`tests/test_call_indirect.py`.
+
+**Step 5 — re-running the qshelf stress test: real, unmodified Grover,
+full honest result.** Ran `packages/grover/src/grover/grover.py`
+(vendored verbatim into `examples/_qshelf_grover.py`, same convention as
+`examples/_qshelf_qft.py`) through `extract_gate_counts`. Needed **8**
+distinct loop trip counts, not just the one array-comprehension `TailLoop`
+— identified each by tracing its owning `FuncDefn`: the register
+allocation `TailLoop` and `discard_array`'s own internal loop (both
+already known from the QFT pass), `diffuser`'s four `for i in range(3)`
+loops, and `grover_search`'s own `for i in range(3)` register-prep loop
+plus its real `for _ in range(iterations)` loop. The last two look
+structurally identical (`for _/i in range(3)`-shaped CFGs with unrelated
+real trip counts, 3 vs. the real `iterations=2`) — distinguished
+**empirically, not by guessing from node-ID order**: supplying a distinct,
+large trial trip count (50) to each candidate header in turn and checking
+which one is the only one that scales the `toffoli` count (only
+`oracle`/`diffuser`'s controlled-X, reached once per real iteration,
+touches `toffoli` at all).
+
+Final result for `MARKED=5`, `N=8`, `ITERATIONS=2` (the optimal count for
+1 marked item out of 8, per Grover's own classical
+`optimal_iterations` helper): **`toffoli: 4, clifford: 47, n_qubits: 3`**.
+Fully hand-verified by isolating `oracle[5]` and `diffuser` independently
+(each as its own permanent test in `tests/test_call_indirect.py`):
+- `oracle[5]` alone: `toffoli: 1, clifford: 8`. Hand count: 6 clifford
+  from the six `if (marked >> k) & 1 == 0: x(...)`-style conditionals
+  (each contributing 1 via upper-bound `max(1, 0)` per branch — see the
+  `@guppy` vs `@guppy.comptime` note below for why these aren't
+  eliminated) + 2 clifford from the two unconditional `h(qs[2])` calls + 1
+  toffoli from the `control(...)`-wrapped `x`.
+- `diffuser` alone: `toffoli: 1, clifford: 14`. Hand count: 4×3=12
+  clifford from the four `for i in range(3): h(...)`/`x(...)` loops + 2
+  clifford from the two unconditional `h(qs[2])` calls + 1 toffoli.
+- Composed: register-prep (3 clifford) + `iterations × (oracle +
+  diffuser)` = `3 + 2×(8+14) = 47` clifford, `2×(1+1) = 4` toffoli — exact
+  match to the tool's actual output.
+
+Also surfaced, incidentally, a genuine and non-obvious new finding worth
+recording on its own: **`marked`'s bit-conditions in `oracle` are NOT
+compile-time-eliminated**, unlike QFT's `@guppy.comptime` loops — because
+`oracle`/`diffuser`/`grover_search` are all plain `@guppy` functions (the
+`control(...)` modifier is explicitly disallowed inside
+`@guppy.comptime` bodies, raising `GuppyComptimeError`, per qshelf's own
+`grover.py` docstring). Each `if (marked >> k) & 1 == 0: ...` compiles to
+a genuine runtime `Conditional` even though `marked` is a compile-time
+`nat` generic parameter with a statically known value — confirmed
+directly by the `oracle[5]` isolated count above (`clifford=8`, not the
+`clifford=4` a naive "obviously-true/false branches get dropped"
+assumption would predict). Anywhere resource estimation composes
+`@guppy.comptime` loop-unrolling (full elimination) with plain-`@guppy`
+`nat`-parameterized conditionals (no elimination, genuine upper-bound
+conservatism applies), don't assume one behaves like the other.
+
+Full `estimate()` output (`scheme=beverland`, `data_d=17`, run for real,
+not fabricated — see `examples/grover_n.py`):
+```
+guppy-estimand result (scheme=beverland, code distance d=17)
+  *** UPPER BOUND -- NOT a point estimate (upper_bound=True) ***
+  logical qubits:    3
+  logical gates:     toffoli: 4, clifford: 47
+  physical qubits:   5,770  (upper bound)
+  runtime:           6.800e-08 hours  (upper bound)
+  total error:       3.255e-04  (upper bound)
+```
+
+**Honest bottom line**: this was a genuine, complete win, not a narrow
+`control(...)`-specific hack — the general "trace `CallIndirect` back
+through `LoadFunc`" check was what got built, it was verified to hold in
+both directions (resolves the real repro, correctly still refuses a real
+constructed dynamic-dispatch case), and it fully unblocks Grover
+end-to-end with the real, unmodified qshelf source — same standard as the
+`TailLoop` pass: verify by hand at every step, implement the general
+pattern found rather than a special case, and report the true boundary
+rather than smoothing over it.
+
 ## Possible future work (not started)
 
 - ~~Support straight-line-with-known-bounds control flow...~~ **Done,
@@ -1104,18 +1285,14 @@ to fix and did not force a fit for.
 - ~~Full `TailLoop` support~~ **Done, 2026-09-06 — see "TailLoop support"
   above.** The one verified shape (array-comprehension idiom) is walked;
   a differently-shaped `TailLoop` still raises `UnsupportedControlFlowShape`.
-- **Resolve `CallIndirect` (found 2026-09-06, see "TailLoop support" above,
-  the Grover investigation).** Confirmed reachable from real code — the
-  `with control(...): x(...)` modifier used throughout qshelf's Grover
-  package compiles to a `LoadFunc` + `CallIndirect` pair, which
-  `CallNotSupported` currently refuses outright. Would need: statically
-  resolving what value flows into a `CallIndirect`'s target port when
-  possible (e.g. tracing a `LoadFunc` back to a known `FuncDefn`, which may
-  be tractable for the specific `control(...)`-modifier pattern even if
-  not for a genuinely dynamic function value) and falling back to
-  `CallNotSupported` (unchanged) only when that's not resolvable. Blocks
-  estimating Grover (and likely anything else using the `control(...)`
-  modifier) entirely today.
+- ~~Resolve `CallIndirect`~~ **Done, 2026-09-07 — see "CallIndirect
+  support" above.** `CallNotSupported` is narrowed further: a
+  `CallIndirect` whose function operand traces back (through exactly one
+  `LoadFunc`) to a `FuncDefn` is now followed and walked, covering
+  `with control(...):` and, per the general pattern found, likely other
+  higher-order-function usages too; a genuinely dynamic function value
+  (verified reachable from real guppy source — see "CallIndirect support")
+  still correctly raises `CallNotSupported`.
 - Extend non-`tket.*`-ExtOp tolerance (currently bounded-mode-only, and
   only as a side effect of a rule designed for something else — see "Real-
   world stress test" point 3 above) to the straight-line walker too, so
