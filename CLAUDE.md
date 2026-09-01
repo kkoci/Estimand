@@ -168,6 +168,38 @@ test will start failing — check Qualtran's CHANGELOG/release notes for a
 real landed fix (not a "won't fix" close) before deleting the override and
 switching `_make_beverland_model` back to Qualtran's own `CompactDataBlock`.
 
+**Update (2026-09-09, audit pass): both issues checked live against
+GitHub, not assumed still exactly as filed.** Both remain **OPEN**,
+installed `qualtran` (0.7.0, unchanged) still reproduces both bugs exactly
+as described above — reconfirmed directly:
+`CompactDataBlock(data_d=17).n_tiles(2)` still returns `3`, not the
+paper-correct `6`, and `test_upstream_qualtran_still_has_the_1943_bug`
+still passes (i.e. the bug is still present; that test is designed to
+start *failing* the moment a real fix lands — see above). Each issue
+picked up exactly one maintainer comment (`mpharrigan`, a Qualtran
+collaborator), read in full, not just skimmed for a thumbs-up/down:
+- **#1943**: the maintainer's response effectively confirms the bug and
+  proposes an equivalent fix, `ceil(1.5*(n+2))` (their reasoning: the
+  compact block needs "two patches and their associated hallway space" per
+  Fig. 9), rather than this project's `ceil(1.5*n) + 3`. These are the
+  same formula: since 3 is an integer, `ceil(1.5n) + 3 == ceil(1.5n + 3)
+  == ceil(1.5*(n+2))` — confirmed algebraically, not just assumed
+  equivalent. No action needed; this is independent validation that the
+  patched formula is right, not a sign it should change.
+- **#1944**: the maintainer pushed back, questioning whether this is a bug
+  at all ("it's called `make_beverland_et_al`... it should reflect
+  Beverland et al.") rather than confirming or fixing it. This is exactly
+  the "may reasonably be closed 'won't fix'" outcome anticipated in Part B
+  above when the decision not to patch #1944 was made — seeing it start to
+  play out live doesn't change that decision (the reasoning for not
+  patching never depended on the issue being *accepted* upstream), but it
+  does mean the caveat text describing this as `"~4.9x understated,
+  unpatched"` should keep being read as *this project's own finding*, not
+  as something Qualtran has confirmed as a bug in their model — which the
+  caveat text already does, correctly, by attributing the ~4.9x figure to
+  "the cited paper's own constant" rather than asserting Qualtran agrees
+  it's wrong.
+
 Verified end-to-end by hand (2026-08-30, qualtran 0.7.0):
 ```python
 from qualtran.resource_counting import GateCounts
@@ -486,7 +518,13 @@ found and fixed, not just confirmed-correct-by-luck:**
   does. It also cannot ever reach an error below the magic-state factory's
   own, `data_d`-independent error floor, for the same reason.
 - Any quantum op not in `gate_counts.py`'s classification tables raises
-  `UnrecognizedGate` rather than being silently dropped.
+  `UnrecognizedGate` rather than being silently dropped. This includes
+  `collections.borrow_arr.*` (array-indexing bookkeeping for `array[qubit,
+  n]`) in straight-line mode specifically — `upper_bound=True` tolerates it
+  today, but only as a side effect of a broader rule built for something
+  else, not a verified allowance — see "Real-world stress test" point 3
+  and "Possible future work". Reconfirmed live during the 2026-09-09 audit
+  pass, not just carried forward from when it was first found.
 
 ## Bounded control flow (opt-in) — added 2026-09-02
 
@@ -697,11 +735,18 @@ project's existing `ControlFlowNotSupported`/`UnrecognizedGate`/
 `UnsupportedControlFlowShape` pattern of refusing to guess rather than
 guessing wrong. It does **not** make QFT-at-4-qubits (or any call to a
 non-inlined function) estimable — that's real future work, tracked below.
-Regression tests: `tests/test_call_not_supported.py` (a minimal
-`discard_array`-based repro, chosen because plain user-defined helper
-functions were found to reliably get inlined at the sizes tried, while
-`discard_array` reliably does not — so it's the smallest available reliable
-trigger for the bug this guards).
+Regression tests (at the time): `tests/test_call_not_supported.py` (a
+minimal `discard_array`-based repro, chosen because plain user-defined
+helper functions were found to reliably get inlined at the sizes tried,
+while `discard_array` reliably does not — so it's the smallest available
+reliable trigger for the bug this guards). **That file no longer exists**
+— once "Call-following" below replaced the blanket refusal with real
+call-following, the same `discard_array` repro was repurposed to assert
+the opposite (that the call IS now followed, not refused) and moved into
+`tests/test_call_following.py::test_call_to_discard_array_is_followed_not_refused`.
+Found stale during the 2026-09-09 audit pass (see "Audit" below); this is
+a historical note about what the fix looked like *at the time*, not a
+pointer to a currently-existing file.
 
 **Step 3/4 — the actual reported result.** Working around both idioms
 (literal array construction instead of the comprehension; individual
@@ -1446,6 +1491,92 @@ quantumlib/Qualtran#1944, already caveated as understated by ~4.9x for the
 beverland scheme's factory-error component specifically — see
 "Decision: adapter to Qualtran" above), not a limitation introduced by
 this feature's search strategy.
+
+## Audit (2026-09-09)
+
+First full-repo, pre-milestone correctness/consistency review — every
+prior pass above was scoped narrowly to its own feature, so this is the
+first time anyone checked the whole project end to end for drift *between*
+passes. Same discipline as every feature pass: verify live, don't trust
+what a prior pass's chat summary claimed.
+
+**What was checked**: CLAUDE.md and README.md read fully, front to back;
+full test suite re-run (`69 passed`, matching the per-file counts each
+pass quoted at the time: 15+7+6+4+3+2+8+24 = 69); all three example
+scripts (`bell_and_t.py`, `qft_n.py`, `grover_n.py`) re-run for real and
+diffed against committed output; both filed Qualtran issues (#1943,
+#1944) checked live against GitHub rather than assumed still exactly as
+filed; the two deliberately-unfixed-gap caveats (Qualtran#1944,
+`array[qubit,n]` indexing) checked against `EstimateResult.__str__`'s
+actual printed text; at least three numeric claims (`bell_and_t`'s 4,614
+qubits/2.036e-05 error, QFT's closed-form formula across n=2/4/6, Grover's
+5,770-qubit/toffoli:4,clifford:47 result) re-derived live, not trusted
+from prior chat.
+
+**Found and fixed, three real issues** — all documentation drift, no code
+bugs:
+1. **A broken README example.** The "Bounded control flow" section's
+   `estimate(compiled, upper_bound=True, loop_trip_counts={8: 5})` snippet
+   omitted `data_d` — this worked when written (before "Auto-selecting
+   data_d" removed `data_d`'s default of 17), and silently broke into a
+   `ValueError` once that pass landed, without anyone rerunning this
+   specific snippet. Reproduced the failure live, then fixed by adding
+   `data_d=17` to both calls in the snippet and re-verified the corrected
+   version's output still matches what's printed below it.
+2. **A stale file reference.** The "Real-world stress test" section's
+   description of the original `CallNotSupported` fix pointed at
+   `tests/test_call_not_supported.py`, which no longer exists — it was
+   superseded by `tests/test_call_following.py` once call-following
+   replaced the blanket refusal, and nobody had gone back to update the
+   now-historical description of the original fix. Fixed by marking that
+   paragraph explicitly historical and naming where the equivalent
+   coverage now lives.
+3. **A real user-facing gap missing from README's "Known limitations".**
+   The `array[qubit, n]`-indexing / `collections.borrow_arr.*` gap (a
+   straight-line program using array indexing raises `UnrecognizedGate`
+   unconditionally) was documented twice in CLAUDE.md but never mentioned
+   in README at all — reconfirmed live (both the straight-line failure and
+   the bounded-mode success) before adding it to README's limitations list
+   and to CLAUDE.md's "Known limitations" section (which previously only
+   had the general `UnrecognizedGate` bullet, not this specific case).
+
+**Checked and found accurate, no changes needed**: package versions in
+"Environment / versions actually used" (guppylang 1.0.2, hugr 0.18.5,
+qualtran 0.7.0 — all reconfirmed against the installed venv); the
+`CallNotSupported`/`RecursiveCallNotSupported`/`UnsupportedControlFlowShape`
+docstrings in `gate_counts.py` against what CLAUDE.md/README claim about
+them; VERIFICATION.md's numeric derivations (re-verified `n_tiles(2)=3`
+live against the still-unpatched upstream `CompactDataBlock`); the
+`EstimateResult.__str__` caveat text against README's committed output,
+byte-for-byte, across all three examples; the "Possible future work" list
+against actual current behavior (the one remaining open item — extending
+non-`tket.*` ExtOp tolerance to the straight-line walker — is still
+genuinely unresolved, confirmed live, not just carried forward
+unquestioned); `tests/test_target_error.py`'s claimed 24-test count and
+`CallIndirect support`'s claimed 39-test pre-pass count (both independently
+recomputed from `pytest --collect-only`, not re-quoted from memory).
+
+**GitHub issue status** (task explicitly asked not to assume prior state
+holds): both #1943 and #1944 checked live, both still **OPEN**, each with
+exactly one maintainer comment since filing — see the "Update
+(2026-09-09, audit pass)" note under "Decision: adapter to Qualtran"
+above for the full detail, including the maintainer's proposed fix for
+#1943 (algebraically identical to this project's own patch) and pushback
+on whether #1944 is a bug at all (an outcome this project's own Part B
+reasoning had already anticipated as reasonable).
+
+**Honest bottom line**: nothing found was a code-correctness bug — the
+gate-counting/call-resolution/bisection logic itself, and its 69-test
+coverage, held up completely under re-verification. What drifted was
+exactly the kind of thing an audit like this is for: a documentation
+example that silently broke when an unrelated later pass changed a
+default, a reference to a file that got renamed/superseded without a
+backward pointer, and a real limitation that got written up in the
+engineering log (CLAUDE.md) but never made it into the user-facing
+summary (README.md). All three are now fixed; nothing else scanned for
+in this pass (front-to-back doc read, live re-run of every example and
+every quoted number, live issue-tracker check) turned up anything else
+stale, contradictory, or inaccurate.
 
 ## Possible future work (not started)
 

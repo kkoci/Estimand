@@ -63,7 +63,10 @@ guppy-estimand result (scheme=beverland, code distance d=17)
 
 Independent verification against the papers `qualtran.surface_code`'s
 `"beverland"` preset actually cites (see [`VERIFICATION.md`](./VERIFICATION.md))
-found two confirmed bugs, both filed upstream and open as of 2026-09-01:
+found two confirmed bugs, both filed upstream 2026-09-01 and confirmed
+still open (installed `qualtran` still reproduces both) as of a live
+recheck on 2026-09-09 — see `CLAUDE.md` for each issue's maintainer
+response:
 
 - **[quantumlib/Qualtran#1943](https://github.com/quantumlib/Qualtran/issues/1943)**
   — Qualtran's `CompactDataBlock` (the default data-block layout) undercounts
@@ -104,6 +107,16 @@ found two confirmed bugs, both filed upstream and open as of 2026-09-01:
 - **Unrecognized gates fail loudly**, not silently. If guppylang adds a new
   quantum op, `estimate()` raises `UnrecognizedGate` rather than dropping it
   from the count.
+- **A straight-line program using `array[qubit, n]` indexing cannot be
+  estimated in default mode at all.** Indexing into a qubit array compiles
+  to `collections.borrow_arr.*` ops, which aren't `tket.*`-namespaced and
+  so aren't in `gate_counts.py`'s classification tables — the straight-line
+  walker raises `UnrecognizedGate` on them. `upper_bound=True` happens to
+  tolerate these ops today, but only as a side effect of a broader "skip
+  any non-`tket.*` ExtOp" rule built for something else (classical loop-
+  condition/iterator-protocol bookkeeping), not because it was designed or
+  verified to handle array indexing specifically — see `CLAUDE.md` "Real-
+  world stress test" and "Possible future work".
 
 ## Auto-selecting data_d
 
@@ -198,11 +211,11 @@ compiled = circ.compile()
 # Loops are keyed by the HUGR node ID of their header block. You don't need
 # to go find it yourself -- LoopTripCountMissing names it:
 try:
-    estimate(compiled, upper_bound=True)
+    estimate(compiled, data_d=17, upper_bound=True)
 except LoopTripCountMissing as e:
     print(e)  # "...loop whose header is HUGR node 8, but no trip count..."
 
-result = estimate(compiled, upper_bound=True, loop_trip_counts={8: 5})
+result = estimate(compiled, data_d=17, upper_bound=True, loop_trip_counts={8: 5})
 print(result)
 ```
 
