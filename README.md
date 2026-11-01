@@ -370,8 +370,13 @@ writeup; summary:
   `estimate()` below runs qshelf's `qft` completely unmodified — the real
   `array(qubit() for _ in range(n))` construction and the real
   `discard_array(qs)` call, zero workarounds — across the full `n=2..6`
-  range, matching the same closed-form formula verified in pass 2 exactly
-  (`clifford = n + 3⌊n/2⌋`, `rotation = n(n-1)/2`).
+  range, matching the closed-form formula exactly
+  (`clifford = n + 3⌊n/2⌋`, `rotation = n(n-1)`).
+- **Re-run after qshelf switched to `cphase` (upstream `269e102`).** QFT's
+  two-qubit gates are now `cphase` = `rz(control, θ/2)` + `crz(control,
+  target, θ)` instead of a bare `crz`, adding one `rz` per pair: rotation
+  goes from `n(n-1)/2` to `n(n-1)`, clifford is unchanged. Physical qubit
+  count is unchanged at every `n`; runtime and total error roughly double.
 - **Also checked, as requested: Grover.** Its premise didn't hold up under
   verification — `grover_search`'s iteration count is a compile-time `nat`
   generic parameter, exactly like QFT's register size, not a genuinely
@@ -401,30 +406,30 @@ Actual output (`python examples/qft_n.py`, guppylang 1.0.2 / qualtran 0.7.0):
 guppy-estimand result (scheme=beverland, code distance d=17)
   *** UPPER BOUND -- NOT a point estimate (upper_bound=True) ***
   logical qubits:    2
-  logical gates:     clifford: 5, rotation: 1
+  logical gates:     clifford: 5, rotation: 2
   physical qubits:   4,614  (upper bound)
-  runtime:           1.870e-07 hours  (upper bound)
-  total error:       2.240e-04  (upper bound)
+  runtime:           3.740e-07 hours  (upper bound)
+  total error:       4.479e-04  (upper bound)
   ...
 
 --- n=4 ---
 guppy-estimand result (scheme=beverland, code distance d=17)
   *** UPPER BOUND -- NOT a point estimate (upper_bound=True) ***
   logical qubits:    4
-  logical gates:     clifford: 10, rotation: 6
+  logical gates:     clifford: 10, rotation: 12
   physical qubits:   6,348  (upper bound)
-  runtime:           1.122e-06 hours  (upper bound)
-  total error:       1.345e-03  (upper bound)
+  runtime:           2.244e-06 hours  (upper bound)
+  total error:       2.690e-03  (upper bound)
   ...
 
 --- n=6 ---
 guppy-estimand result (scheme=beverland, code distance d=17)
   *** UPPER BOUND -- NOT a point estimate (upper_bound=True) ***
   logical qubits:    6
-  logical gates:     clifford: 15, rotation: 15
+  logical gates:     clifford: 15, rotation: 30
   physical qubits:   8,082  (upper bound)
-  runtime:           2.805e-06 hours  (upper bound)
-  total error:       3.364e-03  (upper bound)
+  runtime:           5.610e-06 hours  (upper bound)
+  total error:       6.728e-03  (upper bound)
   ...
 ```
 

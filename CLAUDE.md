@@ -637,12 +637,11 @@ the package name. Found: `qft[n](qs: array[qubit, n])` is decorated
 `@guppy.comptime(daggerable=True)` and generic over the register size `n`,
 with two nested Python-level `for` loops (a rotation cascade: `for i in
 range(n): h(qs[i]); for j in range(i+1, n): crz(...)`) plus a final swap
-pass (`for k in range(n//2): swap(...)`). `iqft` (the inverse) exists in
-the same file but was NOT used, per the landmine noted in the task that
-motivated this exercise: Quantinuum/guppylang#2250, a real, documented,
-unrelated guppylang bug where `iqft` produces a wrong unitary compiled
-standalone vs. combined with `qft`. Only `swap` and `qft` were vendored
-into `examples/_qshelf_qft.py` (verbatim, with an attribution header).
+pass (`for k in range(n//2): swap(...)`). Only `swap` and `qft` were
+vendored into `examples/_qshelf_qft.py` at the time (verbatim, with an
+attribution header). (The source has changed since then: qshelf now uses
+`cphase` instead of a bare `crz`. See "QFT re-run after qshelf's cphase
+fix" below.)
 
 **Step 2 — the actual compiled HUGR structure (verified by hand, several
 surprises).** Compiled a `main()` calling `qft(qs)` on a small register and
@@ -949,6 +948,10 @@ rotation    = CRz            = n*(n-1)/2
 | 5 | 5 + 6 = 11  | 10 | `clifford: 11, rotation: 10` | exact |
 | 6 | 6 + 9 = 15  | 15 | `clifford: 15, rotation: 15` | exact |
 
+(Historical: this table is for qshelf's pre-`cphase` source. The current
+source gives `rotation = n(n-1)`. See "QFT re-run after qshelf's cphase
+fix" below.)
+
 `n_qubits` also matched `n` exactly at every size. `discard_array`'s own
 internal loop needs a trip count (it has one — a real loop, discovered via
 `LoopTripCountMissing` at every `n`), but the *value* supplied for it was
@@ -1112,7 +1115,8 @@ unmodified** source — the real `array(qubit() for _ in range(n))`
 construction and the real `discard_array(qs)` call, no workarounds
 anywhere. **All five sizes succeed and match the exact same closed-form
 formula verified in the call-following pass** (`clifford = n + 3⌊n/2⌋`,
-`rotation = n(n-1)/2`) — identical numeric output to the literal-array
+`rotation = n(n-1)/2`; pre-`cphase` source, see "QFT re-run after
+qshelf's cphase fix") — identical numeric output to the literal-array
 workaround from that pass, confirming the fix doesn't just "not crash" but
 computes the same, already-hand-verified-correct answer.
 
@@ -1161,6 +1165,42 @@ faked) delivered a different kind of value: it corrected a wrong premise
 (Grover's trip count is not runtime-dependent) and surfaced a real,
 previously-unconfirmed gap (`CallIndirect`) that this pass did not set out
 to fix and did not force a fit for.
+
+## QFT re-run after qshelf's cphase fix (2026-11-01)
+
+Upstream qshelf commit `269e102` ("use controlled-phase instead of crz")
+changed QFT's two-qubit gate. The QFT needs CP(θ) = diag(1,1,1,e^{iθ}),
+but the code had used guppylang's `crz`, CRz(θ) = diag(1,1,e^{-iθ/2},e^{iθ/2}).
+The new `cphase(control, target, θ)` helper is `rz(control, θ/2)` followed
+by `crz(control, target, θ)`, which equals CP(θ) up to global phase. This
+also closed out guppylang#2250: the wrong `iqft` unitary was caused by this
+crz/cphase mistake in qshelf's code, not by a guppylang bug. Earlier notes
+here that called it a guppylang bug have been removed.
+`examples/_qshelf_qft.py` was re-vendored from `269e102` (it now includes
+`cphase` and `iqft`).
+
+Version note: qshelf now pins `guppylang==1.0.3`, but this project is still
+on 1.0.2. The re-vendored code compiled and estimated unchanged under 1.0.2,
+so the environment was not upgraded.
+
+Re-run of `examples/qft_n.py` at the same `n=2..6` (`scheme=beverland`,
+`data_d=17`, `upper_bound=True`):
+
+| n | old (crz) clifford / rotation | new (cphase) clifford / rotation | Δ rotation = n(n-1)/2 |
+|---|---|---|---|
+| 2 | 5 / 1  | 5 / 2  | +1  |
+| 3 | 6 / 3  | 6 / 6  | +3  |
+| 4 | 10 / 6 | 10 / 12 | +6 |
+| 5 | 11 / 10 | 11 / 20 | +10 |
+| 6 | 15 / 15 | 15 / 30 | +15 |
+
+Each of the `n(n-1)/2` `cphase` calls adds exactly one `rz`, so the new
+formula is `rotation = n(n-1)` and clifford stays at `n + 3⌊n/2⌋`. Every
+size matched this exactly. `cphase` gets followed whether it is inlined or
+called. `n_phys_qubits` is unchanged at every `n` (4,614 / 5,770 / 6,348 /
+7,504 / 8,082). `duration_hr` and `error` roughly double, because they
+scale with the logical gate count (for example, `n=6` went from
+2.805e-06 h / 3.364e-03 to 5.610e-06 h / 6.728e-03).
 
 ## CallIndirect support (2026-09-07)
 

@@ -1,23 +1,18 @@
 """Vendored from github.com/kkoci/Qshelf, packages/qft/src/qft/qft.py
-(guppylang==1.0.2 pin, matching this project's installed version -- see
-CLAUDE.md "Real-world stress test").
+(upstream commit 269e102, "use controlled-phase instead of crz").
 
-Only `swap` and `qft` are vendored (not `iqft`): this example deliberately
-uses `qft` only, per Quantinuum/guppylang#2250 (`iqft` produces a wrong
-unitary when compiled standalone vs. combined with `qft` -- a real,
-documented guppylang bug unrelated to guppy_estimand; using it here would
-test around an unrelated known-bad code path instead of guppy_estimand
-itself).
+Upstream pins guppylang==1.0.3; this project is still on 1.0.2 (see
+CLAUDE.md "Environment / versions actually used"). The vendored code
+compiles and estimates unchanged under 1.0.2.
 
-Reproduced verbatim (comments trimmed) rather than installed as a package
-dependency, since guppy_estimand's own examples/ shouldn't pull in a whole
-separate project just to demonstrate one function.
+Reproduced verbatim (module docstring trimmed) rather than installed as a
+package dependency, since guppy_estimand's own examples/ shouldn't pull in a
+whole separate project just to demonstrate one function.
 """
-
 from guppylang import guppy
-from guppylang.std.angles import pi
+from guppylang.std.angles import angle, pi
 from guppylang.std.builtins import array, nat
-from guppylang.std.quantum import cx, crz, h, qubit
+from guppylang.std.quantum import crz, cx, h, qubit, rz
 
 
 @guppy(daggerable=True)
@@ -26,6 +21,24 @@ def swap(q0: qubit, q1: qubit) -> None:
     cx(q0, q1)
     cx(q1, q0)
     cx(q0, q1)
+
+
+@guppy(daggerable=True)
+def cphase(control: qubit, target: qubit, theta: angle) -> None:
+    """Controlled-phase gate CP(theta) = diag(1, 1, 1, e^{i theta}), up to global phase.
+
+    Qubit ordering: [control, target]. Built as `rz(control, theta/2)` followed
+    by `crz(control, target, theta)`:
+
+        (Rz(theta/2) (x) I) . CRz(theta) = e^{-i theta/4} . CP(theta)
+
+    The leftover e^{-i theta/4} is a true global phase as long as `cphase` is
+    not itself placed under a `control` modifier (it isn't, anywhere in this
+    package). `crz` alone is NOT a controlled-phase gate: it differs from CP by
+    a relative phase on the control qubit.
+    """
+    rz(control, theta / 2.0)
+    crz(control, target, theta)
 
 
 @guppy.comptime(daggerable=True)
@@ -40,6 +53,23 @@ def qft[n: nat](qs: array[qubit, n]) -> None:
     for i in range(n):
         h(qs[i])
         for j in range(i + 1, n):
-            crz(qs[j], qs[i], pi / 2.0 ** (j - i))
+            cphase(qs[j], qs[i], pi / 2.0 ** (j - i))
     for k in range(n // 2):
         swap(qs[k], qs[n - k - 1])
+
+
+@guppy.comptime(daggerable=True)
+def iqft[n: nat](qs: array[qubit, n]) -> None:
+    """In-place inverse Quantum Fourier Transform on an n-qubit register.
+
+    Exact adjoint of `qft`: the same swaps, then controlled phase rotations and
+    Hadamards in reverse order with negated angles.
+    """
+    for k in range(n // 2):
+        swap(qs[k], qs[n - k - 1])
+    for m in range(n):
+        i = n - 1 - m
+        for jm in range(n - 1 - i):
+            j = n - 1 - jm
+            cphase(qs[j], qs[i], -pi / 2.0 ** (j - i))
+        h(qs[i])
