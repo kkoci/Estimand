@@ -251,17 +251,49 @@ than via QIR.
 
 ## Environment / versions actually used
 
-- guppylang **1.0.2** (not the 0.21.x seen in some cached docs/search
-  results — check installed version directly, don't trust search snippets;
-  `pip show guppylang`).
-- hugr (Python package) **0.18.5**.
-- qualtran **0.7.0**.
+- guppylang **1.2.0** (upgraded from 1.0.2 on 2026-11-01). Check the
+  installed version directly with `pip show guppylang`. Don't trust
+  search snippets: some cached docs and search results still show 0.21.x.
+- guppylang-internals **1.2.0**, hugr (Python package) **0.18.8**, tket
+  **0.15.13**, tket-exts **0.14.3**, selene-hugr-qis-compiler **0.5.1**,
+  selene-sim **0.3.7**. These are whatever guppylang 1.2.0 pulled in.
+  pytket stayed at **2.18.1**, which already satisfies 1.2.0's `>=2.18.1`.
+  (The scratch venv got 2.18.5 with identical results.)
+- qualtran **0.7.0** (unchanged).
 - Python **3.12.13** (via `py -V:Astral/CPython3.12.13`). **Python 3.14.5**
   (the machine's default `python`) has no prebuilt wheels for parts of this
   stack as of 2026-08-30 and pip's dependency resolver/source build hung
   for 10+ minutes; switched to 3.12 and installs completed normally within
   seconds-to-a-minute. If you hit a stuck `pip install`, check your Python
   version first.
+
+**Upgrade from 1.0.2 to 1.2.0 (2026-11-01).** It was tried in a scratch
+venv first. The full 69-test suite passed, and `bell_and_t.py`, `qft_n.py`
+and `grover_n.py` all gave output byte-identical to the 1.0.2 env. The
+main env was then upgraded the same way. No code changes were needed. The
+HUGR shapes in "HUGR quirks" below were hand-inspected against 1.0.2/0.18.5.
+On 1.2.0/0.18.8 they're confirmed only indirectly, by the tests and
+examples still passing. They were not re-inspected by hand.
+
+**pip hang workaround: this hits Python 3.12 too, not only 3.14.** A plain
+`pip install guppylang==1.2.0 qualtran==0.7.0` into a fresh 3.12 venv ran
+for more than 10 minutes without installing anything. pip kept building
+metadata from source distributions (`pip-metadata-*` temp dirs) while it
+searched for a compatible set across qualtran's large dependency tree. What
+worked, and finished in a few minutes:
+
+1. `pip freeze` a known-good env, then drop the lines for the packages you
+   want to move (`guppylang*`, `hugr`, `tket*`, `pytket`, `selene*`, plus
+   transitive deps that must move: `wasmtime`, `networkx`, `tqdm`,
+   `typing_extensions`). Save the rest as `constraints.txt`.
+2. `pip install --only-binary :all: -c constraints.txt guppylang==<ver>`.
+
+The constraints pin everything else, so pip has far fewer combinations to
+try. `--only-binary` stops it from building source distributions just to
+read their metadata. If this still fails, the error will name the
+conflicting package. Free that package from the constraints too and rerun.
+Note that stopping a hung pip from Claude Code's task runner can leave the
+`pip` process running. Check `tasklist` and kill it before retrying.
 
 ## HUGR quirks hit while building this (verified by hand, not assumed)
 
@@ -1179,9 +1211,9 @@ here that called it a guppylang bug have been removed.
 `examples/_qshelf_qft.py` was re-vendored from `269e102` (it now includes
 `cphase` and `iqft`).
 
-Version note: qshelf now pins `guppylang==1.0.3`, but this project is still
-on 1.0.2. The re-vendored code compiled and estimated unchanged under 1.0.2,
-so the environment was not upgraded.
+Version note: qshelf now pins `guppylang==1.0.3`. This re-run was done on
+1.0.2. The project has since moved to 1.2.0 (see "Environment / versions
+actually used"), and the re-run's numbers are identical there.
 
 Re-run of `examples/qft_n.py` at the same `n=2..6` (`scheme=beverland`,
 `data_d=17`, `upper_bound=True`):

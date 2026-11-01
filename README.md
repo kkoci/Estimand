@@ -46,7 +46,7 @@ result = estimate(bell_and_t.compile(), scheme="beverland", data_d=17)
 print(result)
 ```
 
-Actual output (`python examples/bell_and_t.py`, guppylang 1.0.2 / qualtran 0.7.0):
+Actual output (`python examples/bell_and_t.py`, guppylang 1.2.0 / qualtran 0.7.0):
 
 ```
 guppy-estimand result (scheme=beverland, code distance d=17)
@@ -398,7 +398,7 @@ writeup; summary:
   `diffuser` (`toffoli: 1, clifford: 14`) and confirming
   `3 + 2×(8+14) = 47` clifford, `2×(1+1) = 4` toffoli exactly.
 
-Actual output (`python examples/qft_n.py`, guppylang 1.0.2 / qualtran 0.7.0):
+Actual output (`python examples/qft_n.py`, guppylang 1.2.0 / qualtran 0.7.0):
 
 ```
 === QFT on n=2..6 qubits, fully idiomatic qshelf source, zero workarounds ===
@@ -436,7 +436,7 @@ guppy-estimand result (scheme=beverland, code distance d=17)
 (n=3 and n=5 omitted above for brevity — see the file for the full
 `n=2..6` sweep; every size matches the closed-form formula above exactly.)
 
-Actual output (`python examples/grover_n.py`, guppylang 1.0.2 / qualtran 0.7.0):
+Actual output (`python examples/grover_n.py`, guppylang 1.2.0 / qualtran 0.7.0):
 
 ```
 === Grover's algorithm, N=8, marked=5, iterations=2 ===

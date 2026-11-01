@@ -9,8 +9,8 @@ description = "Fault-tolerant physical resource estimation for guppylang/HUGR pr
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "guppylang>=1.0.2",
-    "hugr>=0.18.5",
+    "guppylang>=1.2.0",
+    "hugr>=0.18.8",
     "qualtran>=0.7.0",
 ]
 

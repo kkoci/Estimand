@@ -1,9 +1,9 @@
 """Vendored from github.com/kkoci/Qshelf, packages/qft/src/qft/qft.py
 (upstream commit 269e102, "use controlled-phase instead of crz").
 
-Upstream pins guppylang==1.0.3; this project is still on 1.0.2 (see
-CLAUDE.md "Environment / versions actually used"). The vendored code
-compiles and estimates unchanged under 1.0.2.
+Upstream pins guppylang==1.0.3. This project is on 1.2.0 (see CLAUDE.md
+"Environment / versions actually used"). The vendored code compiles and
+estimates the same under 1.0.2 and 1.2.0.
 
 Reproduced verbatim (module docstring trimmed) rather than installed as a
 package dependency, since guppy_estimand's own examples/ shouldn't pull in a
