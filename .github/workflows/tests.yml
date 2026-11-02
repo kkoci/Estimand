@@ -1,0 +1,51 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # uv instead of pip: pip's resolver can take 10+ minutes on qualtran's
+      # dependency tree (see CLAUDE.md "pip hang workaround").
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install package and test deps
+        run: uv pip install --system --only-binary :all: -e ".[dev]"
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Run examples
+        working-directory: examples
+        run: |
+          python bell_and_t.py
+          python qft_n.py
+          python grover_n.py
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Check metadata
+        run: uvx twine check --strict dist/*

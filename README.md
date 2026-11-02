@@ -12,20 +12,31 @@ This is an **adapter**, not a resource-estimation engine. The actual
 surface-code cost models are [Qualtran](https://github.com/quantumlib/Qualtran)'s
 (Google's) — this project just extracts a gate-count summary from a compiled
 guppy program's HUGR and feeds it to Qualtran's already-published, already-tested
-`qualtran.surface_code.PhysicalCostModel`. See [CLAUDE.md](./CLAUDE.md) for
+`qualtran.surface_code.PhysicalCostModel`. See [CLAUDE.md](https://github.com/kkoci/Estimand/blob/main/CLAUDE.md) for
 why, and for citations.
 
 ## Install
 
 ```bash
-pip install -e .
+pip install guppy-estimand
 ```
 
-Requires Python >= 3.10. (Python 3.14 currently lacks prebuilt wheels for
-some of this stack — see CLAUDE.md. Use 3.11/3.12 if you hit slow/stuck
-source builds.)
+Requires Python >= 3.12 (guppylang 1.2.0's own minimum). Dependencies are
+pinned to the versions this release was verified against:
+`guppylang>=1.2.0,<1.3`, `hugr>=0.18.8,<0.19`, `qualtran>=0.7.0,<0.8`.
 
-## Usage
+Qualtran has a large dependency tree, and plain `pip` can spend a long time
+resolving it. If `pip install` seems stuck, `uv pip install guppy-estimand`
+resolves the same set in seconds, or see CLAUDE.md "pip hang workaround".
+
+For development, from a clone:
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+## Quickstart
 
 ```python
 from guppylang import guppy
@@ -59,10 +70,32 @@ guppy-estimand result (scheme=beverland, code distance d=17)
   note: total error is understated ~4.9x vs. the cited paper's own constant, unpatched (https://github.com/quantumlib/Qualtran/issues/1944); see CLAUDE.md.
 ```
 
+## Scope of v0.1
+
+- **Surface code only.** Two Qualtran presets are supported:
+  `scheme="beverland"` (default) and `scheme="gidney_fowler"`. No other QEC
+  codes, and no hardware-specific models beyond what those presets assume.
+- **Straight-line programs by default; bounded control flow is opt-in.**
+  `if`/`else` and loops raise `ControlFlowNotSupported` unless you pass
+  `upper_bound=True`. With it, you get a worst-case **upper bound**, not a
+  point estimate, and you must supply every loop's trip count yourself.
+  Supported shapes: sequential/nested conditionals, `while`-style loops
+  (nested too), the `array(... for _ in range(n))` comprehension, calls to
+  other guppy functions, and `with control(...)`. See "Bounded control
+  flow" below.
+- **It refuses rather than guesses.** Anything it can't count correctly
+  raises an exception instead of returning a plausible wrong number:
+  `ControlFlowNotSupported`, `UnrecognizedGate`, `LoopTripCountMissing`,
+  `UnsupportedControlFlowShape` (e.g. `for` over an iterator, `break`),
+  `CallNotSupported` (a runtime-chosen function value, or a body-less
+  `FuncDecl`), and `RecursiveCallNotSupported`.
+- **One upstream Qualtran bug is patched locally, one isn't.** See the next
+  section.
+
 ### ⚠️ Known issues in the `"beverland"` scheme (upstream Qualtran, one patched, one not)
 
 Independent verification against the papers `qualtran.surface_code`'s
-`"beverland"` preset actually cites (see [`VERIFICATION.md`](./VERIFICATION.md))
+`"beverland"` preset actually cites (see [`VERIFICATION.md`](https://github.com/kkoci/Estimand/blob/main/VERIFICATION.md))
 found two confirmed bugs, both filed upstream 2026-09-01 and confirmed
 still open (installed `qualtran` still reproduces both) as of a live
 recheck on 2026-09-09 — see `CLAUDE.md` for each issue's maintainer
@@ -77,6 +110,19 @@ response:
   **This project patches it locally** (`guppy_estimand._qualtran_patches.CorrectedCompactDataBlock`)
   — the number above (4,614) is already corrected. Remove the patch once
   #1943 lands a real upstream fix (see `CLAUDE.md`).
+
+  **Version gate.** The patch is only verified against qualtran 0.7.x, so
+  this package depends on `qualtran>=0.7.0,<0.8`. The override replaces
+  `n_tiles()` with the paper's formula (`ceil(1.5n) + 3`). It does not add
+  3 on top of Qualtran's result, so an upstream fix can't cause
+  double-counting. A new qualtran release could still change
+  `CompactDataBlock` in other ways, though. Before widening the bound, run
+  `tests/test_qualtran_patches.py`.
+  `test_upstream_qualtran_still_has_the_1943_bug` fails when installed
+  qualtran no longer has the bug. If it fails, check Qualtran's release
+  notes for a real fix, then delete the override rather than the test.
+  The patch is used only for `scheme="beverland"` with the default
+  `data_block_name="compact"`.
 - **[quantumlib/Qualtran#1944](https://github.com/quantumlib/Qualtran/issues/1944)**
   — the `"beverland"` preset feeds Beverland et al.'s logical-error constant
   (`a=0.03`) into Litinski's magic-state-factory error model instead of
@@ -87,7 +133,7 @@ response:
   cross-paper modeling choice, not a single-answer transcription bug like
   #1943). The `error` field above is the unpatched, understated value.
 
-## Known limitations (v1)
+## Known limitations
 
 - **Straight-line programs only, by default.** Guppy `if`/`else` and loops
   (`while`, `for`) compile to a HUGR `CFG` — loops as a `CFG` with a back
@@ -357,7 +403,7 @@ a wrong number rather than an honest refusal.
 
 ## Real-world stress test: QFT (and Grover) from kkoci/Qshelf
 
-`bell_and_t` above is a hand-written toy. [`examples/qft_n.py`](./examples/qft_n.py)
+`bell_and_t` above is a hand-written toy. [`examples/qft_n.py`](https://github.com/kkoci/Estimand/blob/main/examples/qft_n.py)
 runs guppy_estimand against a real, independently-written algorithm — QFT
 from [kkoci/Qshelf](https://github.com/kkoci/Qshelf) — across three passes.
 See `CLAUDE.md` "Real-world stress test" / "TailLoop support" for the full
@@ -386,7 +432,7 @@ writeup; summary:
   `CallIndirect` was a real, reachable case, not just the
   defensive/untested one it was believed to be.
 - **Grover now works too — see "CallIndirect support" above.**
-  [`examples/grover_n.py`](./examples/grover_n.py) runs qshelf's Grover
+  [`examples/grover_n.py`](https://github.com/kkoci/Estimand/blob/main/examples/grover_n.py) runs qshelf's Grover
   completely unmodified: real `with control(...):` usage in both `oracle`
   and `diffuser`, composed with 8 distinct loop trip counts (register
   allocation, `discard_array`, four loops inside `diffuser`, and
