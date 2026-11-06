@@ -3,17 +3,19 @@
 See CLAUDE.md "HUGR quirks" (2026-09-02) for the hand-verified HUGR
 structures these tests are built against, and "Bounded control flow
 (opt-in)" for the documented design (why loops are keyed by HUGR node ID,
-why n_qubits is not scaled by trip count, why TailLoop and `for`-over-an-
-iterator are explicitly unsupported).
+why n_qubits is not scaled by trip count). `for _ in range(n)` loops are
+covered too: on guppylang 1.2.0 they compile to the same shape as `while`.
 """
+
+import re
 
 import pytest
 from guppylang import guppy
-from guppylang.std.quantum import cx, discard, h, measure, qubit, x
+from guppylang.std.quantum import cx, discard, h, measure, qubit, t, x
 
 from guppy_estimand.gate_counts import (
+    ControlFlowNotSupported,
     LoopTripCountMissing,
-    UnsupportedControlFlowShape,
     extract_gate_counts,
 )
 
@@ -307,23 +309,112 @@ def test_conditional_containing_a_loop():
 # --- Part 4: explicitly unsupported shapes fail loudly, not silently ---
 
 
-def test_for_loop_over_range_is_unsupported():
-    """for-over-range compiles to a nested CFG plus iterator-protocol
-    Option/panic machinery (verified by hand -- see CLAUDE.md), which is
-    NOT the single-CFG-with-back-edge shape this module supports. It must
-    fail loudly (UnsupportedControlFlowShape or LoopTripCountMissing),
-    never silently produce a number."""
+# --- for-over-range: supported, exact counts (hand-verified 2026-11-03) ---
+#
+# Earlier notes said `for _ in range(n)` was unsupported. On guppylang
+# 1.2.0 / hugr 0.18.8 it compiles to the same single-CFG, one-back-edge
+# shape as a `while` loop (inspected by hand for n=2,3,5 -- identical
+# structure, only a Const changes): the entry block is the loop header and
+# holds the range iterator's classical next() logic (int compares/adds, a
+# Conditional, and a gate-free nested CFG with no back edge); the body
+# block holds the loop's gates plus a Conditional whose one case is the
+# unreachable "unwrap None" prelude.panic. QAlloc/QFree sit outside the
+# CFG. So the existing CFG-loop walker applies unchanged, and the trip
+# count to supply is just n. See CLAUDE.md "for-range loops".
+
+
+def _trip_counts_in_discovery_order(compiled, values):
+    """Supplies values[i] to the i-th loop header LoopTripCountMissing
+    names (for nested loops the outer header is named first)."""
+    trips: dict[int, int] = {}
+    for value in values:
+        with pytest.raises(LoopTripCountMissing) as e:
+            extract_gate_counts(compiled, upper_bound=True, loop_trip_counts=trips)
+        trips[int(re.search(r"HUGR node (\d+)", str(e.value)).group(1))] = value
+    return extract_gate_counts(compiled, upper_bound=True, loop_trip_counts=trips)
+
+
+@guppy
+def _for_range_2() -> None:
+    q = qubit()
+    for _ in range(2):
+        h(q)
+        t(q)
+    discard(q)
+
+
+@guppy
+def _for_range_3() -> None:
+    q = qubit()
+    for _ in range(3):
+        h(q)
+        t(q)
+    discard(q)
+
+
+@guppy
+def _for_range_5() -> None:
+    q = qubit()
+    for _ in range(5):
+        h(q)
+        t(q)
+    discard(q)
+
+
+@pytest.mark.parametrize("n, func", [(2, _for_range_2), (3, _for_range_3), (5, _for_range_5)])
+def test_for_loop_over_range_exact_count(n, func):
+    """Body is one H + one T (distinct gates, so the optimizer can't cancel
+    them). Hand count for range(n): clifford = n, t = n, one qubit."""
+    gc, n_qubits = _trip_counts_in_discovery_order(func.compile(), [n])
+    assert (gc.clifford, gc.t, gc.toffoli, gc.rotation, gc.measurement) == (n, n, 0, 0, 0)
+    assert n_qubits == 1
+
+
+def test_for_loop_over_range_needs_upper_bound_in_default_mode():
+    with pytest.raises(ControlFlowNotSupported):
+        extract_gate_counts(_for_range_3.compile())
+
+
+def test_for_loop_over_range_nested():
+    """for 2: x; for 3: (h, t).  Hand count: clifford = 2*1 + 2*3*1 = 8,
+    t = 2*3 = 6. Swapping which trip count goes to which header changes
+    clifford to 3 + 6 = 9, confirming the first-named header is the outer
+    loop (its x scales by the outer count alone)."""
 
     @guppy
     def circ() -> None:
-        q0 = qubit()
-        for _ in range(3):
-            h(q0)
-        discard(q0)
+        q = qubit()
+        for _ in range(2):
+            x(q)
+            for _ in range(3):
+                h(q)
+                t(q)
+        discard(q)
 
     compiled = circ.compile()
-    with pytest.raises((UnsupportedControlFlowShape, LoopTripCountMissing)):
-        extract_gate_counts(compiled, upper_bound=True, loop_trip_counts={})
+    gc, n_qubits = _trip_counts_in_discovery_order(compiled, [2, 3])
+    assert (gc.clifford, gc.t, n_qubits) == (8, 6, 1)
+    gc, _ = _trip_counts_in_discovery_order(compiled, [3, 2])
+    assert (gc.clifford, gc.t) == (9, 6)
+
+
+def test_for_loop_over_range_sequential():
+    """for 2: (h, t); then for 3: (x, h).  Hand count: clifford = 2 + 6 = 8,
+    t = 2."""
+
+    @guppy
+    def circ() -> None:
+        q = qubit()
+        for _ in range(2):
+            h(q)
+            t(q)
+        for _ in range(3):
+            x(q)
+            h(q)
+        discard(q)
+
+    gc, n_qubits = _trip_counts_in_discovery_order(circ.compile(), [2, 3])
+    assert (gc.clifford, gc.t, n_qubits) == (8, 2, 1)
 
 
 # --- Part 5: nested loops ---

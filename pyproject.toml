@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "guppy-estimand"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fault-tolerant physical resource estimation for guppylang/HUGR programs"
 readme = "README.md"
 license = "Apache-2.0"
@@ -38,11 +38,18 @@ classifiers = [
 Homepage = "https://github.com/kkoci/Estimand"
 Repository = "https://github.com/kkoci/Estimand"
 Issues = "https://github.com/kkoci/Estimand/issues"
-Documentation = "https://github.com/kkoci/Estimand#readme"
+Documentation = "https://kkoci.github.io/Estimand/"
+
+[project.scripts]
+guppy-estimand = "guppy_estimand.cli:main"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+]
+docs = [
+    "mkdocs>=1.6,<2",
+    "mkdocs-material>=9.5,<10",
 ]
 
 [tool.hatch.build.targets.wheel]

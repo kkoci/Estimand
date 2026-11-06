@@ -42,6 +42,8 @@ Scheme = Literal["beverland", "gidney_fowler"]
 #     rather than silently asserting our own answer is more "correct."
 _BEVERLAND_QUBIT_UNDERCOUNT_ISSUE = "https://github.com/quantumlib/Qualtran/issues/1943"
 _BEVERLAND_ERROR_UNDERSTATEMENT_ISSUE = "https://github.com/quantumlib/Qualtran/issues/1944"
+VERIFICATION_URL = "https://github.com/kkoci/Estimand/blob/main/VERIFICATION.md"
+"""Public, user-facing writeup of the cost-model checks behind both caveats."""
 
 
 @dataclass(frozen=True)
@@ -80,11 +82,11 @@ class EstimateResult:
             if self.data_block_name == "compact":
                 lines.append(
                     "  note: physical qubits include a local fix for a confirmed Qualtran "
-                    f"bug ({_BEVERLAND_QUBIT_UNDERCOUNT_ISSUE}); see CLAUDE.md."
+                    f"bug ({_BEVERLAND_QUBIT_UNDERCOUNT_ISSUE}); see {VERIFICATION_URL} (section 8)."
                 )
             lines.append(
                 "  note: total error is understated ~4.9x vs. the cited paper's own "
-                f"constant, unpatched ({_BEVERLAND_ERROR_UNDERSTATEMENT_ISSUE}); see CLAUDE.md."
+                f"constant, unpatched ({_BEVERLAND_ERROR_UNDERSTATEMENT_ISSUE}); see {VERIFICATION_URL} (section 7)."
             )
         return "\n".join(lines)
 
@@ -200,8 +202,8 @@ def _select_data_d_for_target_error(
                 f"{target_error:.3e} for scheme={scheme!r} (achieved error="
                 f"{hi_error:.3e} at d={hi_d}). Increasing data_d only reduces the "
                 "data block's own error contribution -- it never reduces the magic "
-                "state factory's, which is independent of data_d (see CLAUDE.md "
-                "'Auto-selecting data_d'), so a target below the factory's own error "
+                "state factory's, which is independent of data_d (see "
+                f"{VERIFICATION_URL} sections 6-7), so a target below the factory's own error "
                 "floor can never be reached by any data_d. Try a looser target_error, "
                 "different scheme_kwargs (e.g. smaller factory_ds), or supply data_d "
                 "directly and inspect EstimateResult.error yourself."
@@ -290,7 +292,7 @@ def estimate(
             no entry in ``loop_trip_counts``.
         UnsupportedControlFlowShape: ``upper_bound=True`` and the program's
             control flow has a shape not hand-verified as boundable (e.g. a
-            ``for`` loop over an iterator, or a loop with an internal
+            loop with more than one back edge, or a loop with an internal
             ``break``) -- see CLAUDE.md.
     """
     gate_counts, n_qubits = extract_gate_counts(

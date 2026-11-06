@@ -12,8 +12,10 @@ This is an **adapter**, not a resource-estimation engine. The actual
 surface-code cost models are [Qualtran](https://github.com/quantumlib/Qualtran)'s
 (Google's) — this project just extracts a gate-count summary from a compiled
 guppy program's HUGR and feeds it to Qualtran's already-published, already-tested
-`qualtran.surface_code.PhysicalCostModel`. See [CLAUDE.md](https://github.com/kkoci/Estimand/blob/main/CLAUDE.md) for
-why, and for citations.
+`qualtran.surface_code.PhysicalCostModel`. See [VERIFICATION.md](https://github.com/kkoci/Estimand/blob/main/VERIFICATION.md) for
+the citations, and for a check of each formula against its source paper.
+
+Documentation: <https://kkoci.github.io/Estimand/>
 
 ## Install
 
@@ -27,7 +29,9 @@ pinned to the versions this release was verified against:
 
 Qualtran has a large dependency tree, and plain `pip` can spend a long time
 resolving it. If `pip install` seems stuck, `uv pip install guppy-estimand`
-resolves the same set in seconds, or see CLAUDE.md "pip hang workaround".
+resolves the same set in seconds. With plain `pip`, adding
+`--only-binary :all:` (so pip doesn't build source distributions just to
+read their metadata) usually gets it unstuck.
 
 For development, from a clone:
 
@@ -57,6 +61,12 @@ result = estimate(bell_and_t.compile(), scheme="beverland", data_d=17)
 print(result)
 ```
 
+Or, from the command line (see "Command line" below):
+
+```bash
+guppy-estimand examples/bell_and_t.py:bell_and_t
+```
+
 Actual output (`python examples/bell_and_t.py`, guppylang 1.2.0 / qualtran 0.7.0):
 
 ```
@@ -66,11 +76,50 @@ guppy-estimand result (scheme=beverland, code distance d=17)
   physical qubits:   4,614
   runtime:           1.700e-08 hours
   total error:       2.036e-05
-  note: physical qubits include a local fix for a confirmed Qualtran bug (https://github.com/quantumlib/Qualtran/issues/1943); see CLAUDE.md.
-  note: total error is understated ~4.9x vs. the cited paper's own constant, unpatched (https://github.com/quantumlib/Qualtran/issues/1944); see CLAUDE.md.
+  note: physical qubits include a local fix for a confirmed Qualtran bug (https://github.com/quantumlib/Qualtran/issues/1943); see https://github.com/kkoci/Estimand/blob/main/VERIFICATION.md (section 8).
+  note: total error is understated ~4.9x vs. the cited paper's own constant, unpatched (https://github.com/quantumlib/Qualtran/issues/1944); see https://github.com/kkoci/Estimand/blob/main/VERIFICATION.md (section 7).
 ```
 
-## Scope of v0.1
+## Command line
+
+Installing the package adds a `guppy-estimand` command:
+
+```
+guppy-estimand path/to/file.py:func_name [--scheme beverland|gidney_fowler]
+               [--d 17] [--upper-bound] [--trip-counts JSON]
+```
+
+It imports the file, compiles the named `@guppy` function, and prints the
+same result `estimate()` returns. `--d` defaults to 17. `python -m
+guppy_estimand` does the same thing.
+
+```bash
+guppy-estimand examples/bell_and_t.py:bell_and_t --scheme gidney_fowler --d 11
+```
+
+Errors are printed as one line on stderr, with exit status 1, not as a
+traceback. For programs with loops, run with `--upper-bound` first. The
+error names the loop's HUGR node ID. Add it to `--trip-counts` and run
+again, once per loop:
+
+```console
+$ guppy-estimand examples/qft_n.py:main_n2 --upper-bound
+error: LoopTripCountMissing: program contains a loop whose header is HUGR node 7, ... [CLI: add "7": <count> to --trip-counts, keeping any counts already passed]
+$ guppy-estimand examples/qft_n.py:main_n2 --upper-bound --trip-counts '{"7": 2}'
+error: LoopTripCountMissing: program contains a loop whose header is HUGR node 136, ...
+$ guppy-estimand examples/qft_n.py:main_n2 --upper-bound --trip-counts '{"7": 2, "136": 2}'
+guppy-estimand result (scheme=beverland, code distance d=17)
+  *** UPPER BOUND -- NOT a point estimate (upper_bound=True) ***
+  logical qubits:    2
+  logical gates:     clifford: 5, rotation: 2
+  physical qubits:   4,614  (upper bound)
+  ...
+```
+
+On Windows `cmd.exe`, quote the JSON with double quotes and escape the
+inner ones: `--trip-counts "{\"7\": 2, \"136\": 2}"`.
+
+## Scope of v0.2
 
 - **Surface code only.** Two Qualtran presets are supported:
   `scheme="beverland"` (default) and `scheme="gidney_fowler"`. No other QEC
@@ -79,14 +128,15 @@ guppy-estimand result (scheme=beverland, code distance d=17)
   `if`/`else` and loops raise `ControlFlowNotSupported` unless you pass
   `upper_bound=True`. With it, you get a worst-case **upper bound**, not a
   point estimate, and you must supply every loop's trip count yourself.
-  Supported shapes: sequential/nested conditionals, `while`-style loops
-  (nested too), the `array(... for _ in range(n))` comprehension, calls to
+  Supported shapes: sequential/nested conditionals, `while` and
+  `for _ in range(n)` loops (nested too), the
+  `array(... for _ in range(n))` comprehension, calls to
   other guppy functions, and `with control(...)`. See "Bounded control
   flow" below.
 - **It refuses rather than guesses.** Anything it can't count correctly
   raises an exception instead of returning a plausible wrong number:
   `ControlFlowNotSupported`, `UnrecognizedGate`, `LoopTripCountMissing`,
-  `UnsupportedControlFlowShape` (e.g. `for` over an iterator, `break`),
+  `UnsupportedControlFlowShape` (e.g. a loop with `break`),
   `CallNotSupported` (a runtime-chosen function value, or a body-less
   `FuncDecl`), and `RecursiveCallNotSupported`.
 - **One upstream Qualtran bug is patched locally, one isn't.** See the next
@@ -98,8 +148,8 @@ Independent verification against the papers `qualtran.surface_code`'s
 `"beverland"` preset actually cites (see [`VERIFICATION.md`](https://github.com/kkoci/Estimand/blob/main/VERIFICATION.md))
 found two confirmed bugs, both filed upstream 2026-09-01 and confirmed
 still open (installed `qualtran` still reproduces both) as of a live
-recheck on 2026-09-09 — see `CLAUDE.md` for each issue's maintainer
-response:
+recheck on 2026-09-09 (each issue has a maintainer response; see the
+issue threads):
 
 - **[quantumlib/Qualtran#1943](https://github.com/quantumlib/Qualtran/issues/1943)**
   — Qualtran's `CompactDataBlock` (the default data-block layout) undercounts
@@ -109,7 +159,7 @@ response:
   physical qubits where the cited paper's own formula gives **4,614**.
   **This project patches it locally** (`guppy_estimand._qualtran_patches.CorrectedCompactDataBlock`)
   — the number above (4,614) is already corrected. Remove the patch once
-  #1943 lands a real upstream fix (see `CLAUDE.md`).
+  #1943 lands a real upstream fix (see [`VERIFICATION.md`](https://github.com/kkoci/Estimand/blob/main/VERIFICATION.md) §8).
 
   **Version gate.** The patch is only verified against qualtran 0.7.x, so
   this package depends on `qualtran>=0.7.0,<0.8`. The override replaces
@@ -129,16 +179,16 @@ response:
   Litinski's own constant (`a=0.1`, arXiv:1905.06903 Eq. 7), understating
   the reported `error` field by roughly **4.9x** relative to what Litinski's
   own paper would predict for the same factory. **This project does *not*
-  patch this one locally** — see `CLAUDE.md` for why (it's a genuine
-  cross-paper modeling choice, not a single-answer transcription bug like
-  #1943). The `error` field above is the unpatched, understated value.
+  patch this one locally** — see [`VERIFICATION.md`](https://github.com/kkoci/Estimand/blob/main/VERIFICATION.md) §7 and
+  "Recommendation" for why (it's a genuine cross-paper modeling choice,
+  not a single-answer transcription bug like #1943). The `error` field above is the unpatched, understated value.
 
 ## Known limitations
 
 - **Straight-line programs only, by default.** Guppy `if`/`else` and loops
   (`while`, `for`) compile to a HUGR `CFG` — loops as a `CFG` with a back
-  edge, *not* a `TailLoop` node (verified by hand; see `CLAUDE.md` "HUGR
-  quirks"). Naively summing gate counts across all HUGR nodes would count
+  edge, *not* a `TailLoop` node (verified by hand against compiled
+  programs). Naively summing gate counts across all HUGR nodes would count
   every branch (only one runs) and undercount loop bodies (which run N
   times but appear once in the graph). Rather than silently produce a
   wrong number, `estimate()` raises `ControlFlowNotSupported` if it finds
@@ -161,8 +211,8 @@ response:
   tolerate these ops today, but only as a side effect of a broader "skip
   any non-`tket.*` ExtOp" rule built for something else (classical loop-
   condition/iterator-protocol bookkeeping), not because it was designed or
-  verified to handle array indexing specifically — see `CLAUDE.md` "Real-
-  world stress test" and "Possible future work".
+  verified to handle array indexing specifically. Extending that
+  tolerance to the default mode is planned.
 
 ## Auto-selecting data_d
 
@@ -187,15 +237,16 @@ guppy-estimand result (scheme=beverland, code distance d=11)
   physical qubits:   2,598
   runtime:           1.100e-08 hours
   total error:       3.815e-05
-  note: physical qubits include a local fix for a confirmed Qualtran bug (https://github.com/quantumlib/Qualtran/issues/1943); see CLAUDE.md.
-  note: total error is understated ~4.9x vs. the cited paper's own constant, unpatched (https://github.com/quantumlib/Qualtran/issues/1944); see CLAUDE.md.
+  note: physical qubits include a local fix for a confirmed Qualtran bug (https://github.com/quantumlib/Qualtran/issues/1943); see https://github.com/kkoci/Estimand/blob/main/VERIFICATION.md (section 8).
+  note: total error is understated ~4.9x vs. the cited paper's own constant, unpatched (https://github.com/quantumlib/Qualtran/issues/1944); see https://github.com/kkoci/Estimand/blob/main/VERIFICATION.md (section 7).
 ```
 
 `d=11` (not `d=17`, the value used elsewhere in this README) because it's
 the *smallest* odd distance that meets `1e-4` for this program — a looser
 target than `d=17`'s own `2.036e-05`, so a smaller, cheaper distance
-suffices. See `CLAUDE.md` "Auto-selecting data_d" for the full
-by-hand monotonicity verification this search relies on.
+suffices. Bisection is valid because `error` was checked to be
+non-increasing in `d` (a numeric sweep from `d=1` to `d=1001`, both
+schemes, three gate profiles) before the search was written.
 
 **There's a hard floor.** Total error is `factory_error + data_error`, and
 only `data_error` depends on `data_d` — `factory_error` comes from the
@@ -211,7 +262,8 @@ ValueError: No code distance up to d=100001 achieves target_error=1.000e-10
 for scheme='beverland' (achieved error=2.033e-05 at d=100001). Increasing
 data_d only reduces the data block's own error contribution -- it never
 reduces the magic state factory's, which is independent of data_d (see
-CLAUDE.md 'Auto-selecting data_d'), so a target below the factory's own
+https://github.com/kkoci/Estimand/blob/main/VERIFICATION.md sections 6-7),
+so a target below the factory's own
 error floor can never be reached by any data_d. Try a looser target_error,
 different scheme_kwargs (e.g. smaller factory_ds), or supply data_d
 directly and inspect EstimateResult.error yourself.
@@ -282,19 +334,23 @@ ID) if you forget one, and never silently assumes a value. If your trip
 count is wrong, the bound is wrong; `guppy_estimand` has no way to check it
 against your program's actual runtime behavior.
 
-**Scope, as of this writing** (see `CLAUDE.md` "Bounded control flow
-(opt-in)" for the full derivation and why each limit exists):
+**Scope, as of this writing:**
 - Sequential and nested conditionals: supported, verified.
 - `while`-style loops (single `CFG` with one back edge): supported,
   verified, including loop-containing-conditional and
   conditional-containing-loop.
-- `for` loops over an iterator (`for x in range(...)`, etc.): **not
-  supported** — these compile to a structurally different, more complex
-  shape (a nested `CFG` plus iterator-protocol machinery) that hasn't been
-  hand-verified yet. Raises `UnsupportedControlFlowShape`.
+- `for _ in range(n)` loops: supported, verified by hand on guppylang
+  1.2.0. They compile to the same single-`CFG`, one-back-edge shape as a
+  `while` loop. The loop header also holds the range iterator's classical
+  bookkeeping (integer compares, a gate-free nested `CFG`, and an
+  unreachable `panic` case), which contributes no gates. Supply `n` as the
+  trip count. Gate counts were checked against hand counts for `n=2,3,5`,
+  nested and back-to-back. `for` over other iterables (e.g. iterating an
+  array) hasn't been checked. If its shape differs, it raises
+  `UnsupportedControlFlowShape`.
 - **`TailLoop` is now supported, for one verified shape** — see "TailLoop
-  support" below. Plain `while`/`for` *statements* never compile to
-  `TailLoop` in guppylang 1.0.2, but the `array(x for _ in range(n))`
+  support" below. Plain `while`/`for` *statements* don't compile to
+  `TailLoop` (checked on guppylang 1.0.2 and again on 1.2.0), but the `array(x for _ in range(n))`
   array-*comprehension* idiom does, and that one shape is what's
   supported. A `TailLoop` with a different internal structure (not
   reducible to a 2-Case continue/break `Conditional` feeding the loop's
@@ -313,9 +369,9 @@ against your program's actual runtime behavior.
   loudly as `RecursiveCallNotSupported`, rather than looping forever or
   guessing a bound.
 - `n_qubits` is **not** multiplied by a loop's trip count (only gate counts
-  are) — see `CLAUDE.md` for the reasoning (guppy's linear qubit typing
+  are). The reasoning: guppy's linear qubit typing
   means a loop body's qubit is freed and reused each iteration, not
-  allocated `N` times over).
+  allocated `N` times over.
 
 ## Call-following
 
@@ -329,8 +385,7 @@ loop-trip-count treatment, recursively, arbitrarily deep.
 callee's internal loop is keyed by its header's HUGR node ID — the same
 scheme as any other loop, **not** namespaced per call site. This is safe
 because the same instantiation of a function, called from multiple sites,
-resolves to one shared `FuncDefn` (verified by hand, not assumed — see
-`CLAUDE.md` "Call-following"), so that loop's header has one fixed node ID
+resolves to one shared `FuncDefn` (verified by hand, not assumed), so that loop's header has one fixed node ID
 regardless of how many places call it. What this gets right automatically,
 with no special-casing: call the same function once outside a loop and
 once inside a caller-side loop with trip count `N`, and its cost is picked
@@ -391,8 +446,9 @@ static `Call` edge. `estimate()`/`extract_gate_counts()` now resolve this:
 when a `CallIndirect`'s function operand traces back through a `LoadFunc`
 to a known `FuncDefn`, it's followed and walked exactly like an ordinary
 `Call` (same recursion detection, same memoization — see "Call-following"
-above). See `CLAUDE.md` "CallIndirect support" for the full hand-verified
-`LoadFunc`/`CallIndirect` wiring.
+above). The function operand is always `CallIndirect`'s port 0, and a
+`LoadFunc`'s target is always its port 0; both were checked against the
+installed `hugr` package's source.
 
 This is a general pattern, not a `control(...)`-specific special case —
 verified by also constructing a genuinely dynamic case (a function value
@@ -406,8 +462,7 @@ a wrong number rather than an honest refusal.
 `bell_and_t` above is a hand-written toy. [`examples/qft_n.py`](https://github.com/kkoci/Estimand/blob/main/examples/qft_n.py)
 runs guppy_estimand against a real, independently-written algorithm — QFT
 from [kkoci/Qshelf](https://github.com/kkoci/Qshelf) — across three passes.
-See `CLAUDE.md` "Real-world stress test" / "TailLoop support" for the full
-writeup; summary:
+Summary:
 
 - **Passes 1–2** found and fixed a silent undercount from un-followed
   function calls (`discard_array(qs)`, and QFT itself above ~4 qubits) —
@@ -438,7 +493,7 @@ writeup; summary:
   allocation, `discard_array`, four loops inside `diffuser`, and
   `grover_search`'s own register-prep loop plus its real
   `iterations`-count loop — the latter two distinguished empirically, not
-  by guessing; see `CLAUDE.md`). For `N=8` items, 1 marked (`marked=5`),
+  by guessing; the technique is in `examples/grover_n.py`). For `N=8` items, 1 marked (`marked=5`),
   optimal `iterations=2`: `toffoli: 4, clifford: 47` — hand-verified by
   independently isolating `oracle[5]` (`toffoli: 1, clifford: 8`) and
   `diffuser` (`toffoli: 1, clifford: 14`) and confirming
@@ -501,6 +556,8 @@ guppy-estimand result (scheme=beverland, code distance d=17)
 
 - `src/guppy_estimand/gate_counts.py` — HUGR walker: compiled guppy program → Qualtran `GateCounts`.
 - `src/guppy_estimand/estimate.py` — `GateCounts` → Qualtran `PhysicalCostModel` → `EstimateResult`.
+- `src/guppy_estimand/cli.py` — the `guppy-estimand` command.
+- `docs/` — the documentation site (mkdocs-material).
 - `examples/` — runnable guppy programs with expected output, including
   `qft_n.py` / `_qshelf_qft.py` and `grover_n.py` / `_qshelf_grover.py`
   (real-world stress tests, see above, each with its minimal vendored

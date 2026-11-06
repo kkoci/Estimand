@@ -512,7 +512,7 @@ def _walk_region_straight_line(hugr: Hugr, container: Node, ctx: _WalkCtx) -> _R
                 "straight-line (control-flow-free) guppy programs by default. "
                 "Pass upper_bound=True to estimate()/extract_gate_counts() to "
                 "opt into worst-case bounding instead. See "
-                "CLAUDE.md 'Known limitations' / 'Bounded control flow (opt-in)'."
+                "https://github.com/kkoci/Estimand#bounded-control-flow-opt-in-upper_boundtrue"
             )
         if isinstance(op, ops.CallIndirect):
             cost = cost + _walk_call_indirect(hugr, child, ctx, _walk_region_straight_line)
@@ -547,11 +547,14 @@ def _extract_gate_counts_straight_line(hugr: Hugr) -> tuple[GateCounts, int]:
 #     structure.
 #   - `while` loops compile to a CFG with a genuine cycle (a DataflowBlock
 #     branching back to an earlier DataflowBlock) -- NOT to a `TailLoop`
-#     node. `for` loops over an iterator compile similarly but with an
-#     additional NESTED CFG plus Option/panic unwrap machinery for the
-#     iterator protocol -- this nested/iterator-protocol shape is NOT
-#     supported here (raises UnsupportedControlFlowShape); only single-CFG
-#     while-style back-edge loops are verified and supported.
+#     node. `for _ in range(n)` compiles to the SAME single-CFG,
+#     one-back-edge shape (re-verified by hand on guppylang 1.2.0,
+#     2026-11-03): its header block additionally holds the range
+#     iterator's classical next() logic, including a gate-free nested CFG
+#     with no back edge, and its body holds an unreachable Option-unwrap
+#     panic Conditional. Both contribute zero gates, so it is handled by
+#     the while-loop code below with trip count n. See CLAUDE.md
+#     "for-range loops".
 #   - Because loops are CFG back edges, not TailLoop, `ops.TailLoop` is
 #     kept as an explicit "not supported" case (raises
 #     UnsupportedControlFlowShape) rather than given speculative,

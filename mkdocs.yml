@@ -1,0 +1,41 @@
+site_name: guppy-estimand
+site_description: Fault-tolerant physical resource estimation for guppylang/HUGR programs
+site_url: https://kkoci.github.io/Estimand/
+repo_url: https://github.com/kkoci/Estimand
+repo_name: kkoci/Estimand
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.footer
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Install: install.md
+  - Quickstart: quickstart.md
+  - Command line: cli.md
+  - Scope: scope.md
+  - Known issues: known-issues.md

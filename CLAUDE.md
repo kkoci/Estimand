@@ -390,12 +390,14 @@ optimizer's effect on repeated gates):**
     machinery for the iterator's `Option`-unwrap protocol
     (`MakeTuple`/`UnpackTuple` for the `(start, stop, step)` state,
     `arithmetic.int.*` comparisons, a `panic` case for the
-    "unwrap on `None`" branch that should be unreachable). **This shape is
-    not supported by the bounded walker** (raises
-    `UnsupportedControlFlowShape`) — only single-CFG, single-back-edge
-    `while`-style loops are handled. This is a deliberate scope decision,
-    not an oversight: handling the nested-CFG/iterator-protocol shape
-    correctly would need its own separate hand-verification pass.
+    "unwrap on `None`" branch that should be unreachable). ~~This shape is
+    not supported by the bounded walker (raises
+    `UnsupportedControlFlowShape`).~~ **Corrected 2026-11-03: wrong.** The
+    nested `CFG` sits inside the loop *header* block and has no back edge;
+    the outer CFG still has exactly one back edge, so the shape is the
+    ordinary `while` shape and the walker handles it (it never raised
+    `UnsupportedControlFlowShape` for this; the old test accepted either
+    exception). See "for-range loops (2026-11-03)" below.
   - Because loops are CFG back edges rather than an explicit node type,
     **a loop is keyed, for `loop_trip_counts`, by the HUGR node ID of its
     header block** (the back-edge *target*) — chosen over "order of
@@ -612,8 +614,7 @@ alternative**, not a replacement for the default straight-line-only path
   rather than returning a number that looks like a normal estimate.
 
 **What's explicitly NOT supported** (raises `UnsupportedControlFlowShape`
-rather than silently guessing): `for` loops over an iterator (nested
-CFG + iterator-protocol machinery — see "HUGR quirks" above), a loop with
+rather than silently guessing): a loop with
 more than one back edge into the same header, a loop header without
 exactly one "into the loop" and one "exit" successor, a loop body with an
 internal early exit (e.g. `break`). Each of these unsupported shapes would
@@ -1650,12 +1651,85 @@ in this pass (front-to-back doc read, live re-run of every example and
 every quoted number, live issue-tracker check) turned up anything else
 stale, contradictory, or inaccurate.
 
+## 0.2.0 prep (2026-11-03)
+
+- `guppy-estimand` CLI (`src/guppy_estimand/cli.py`, also `python -m
+  guppy_estimand`), tests in `tests/test_cli.py`. Estimator exceptions
+  print as one `error: Name: message` line on stderr (exit 1), plus a
+  `[CLI: ...]` hint translating `loop_trip_counts=` into `--trip-counts`.
+- User-facing output (caveat notes, error messages) and README no longer
+  point at this file. Qualtran caveats link to VERIFICATION.md (sections
+  7/8); VERIFICATION.md's "Recommendation" now carries the #1944
+  don't-patch reasoning itself instead of deferring here.
+- mkdocs-material site in `docs/`, deployed by `.github/workflows/docs.yml`.
+- Found that `for _ in range(n)` is walked, not refused, contradicting
+  the docs. Resolved by hand inspection, see "for-range loops" next.
+
+## for-range loops (2026-11-03)
+
+Earlier notes ("HUGR quirks" 2026-09-02, "Bounded control flow") said
+`for _ in range(n)` raises `UnsupportedControlFlowShape`. It doesn't, and
+on guppylang 1.2.0 / hugr 0.18.8 it's counted correctly. Checked by hand:
+
+**Compiled shape.** `q = qubit(); for _ in range(n): h(q); t(q);
+discard(q)` was compiled for n=2, 3, 5. All three HUGRs had identical
+structure and node IDs; only a `Const` differs. No `TailLoop`, one
+`FuncDefn`.
+- `QAlloc`/`QFree` are direct children of the `FuncDefn`, outside the CFG.
+- Outer `CFG` (node 4) has blocks `[5, 73, 74]` and exactly **one back
+  edge, 74 → 5**. Entry block 5 is the loop header with successors
+  {73 = ExitBlock, 74 = body}, the same as a `while` header.
+- Header 5 holds the range iterator's next(): `arithmetic.int.ige_s`/
+  `ile_s`/`iadd`, a `Conditional` (9), and a **nested `CFG` (23)** with 7
+  blocks, **no back edge**, and no `tket.*` ops (its own `Conditional` 47
+  is classical too). This nested CFG is what the old note called
+  "structurally more complex". It's a gate-free DAG walked as ordinary
+  header content.
+- Body 74 holds exactly `tket.quantum.H`, `tket.quantum.T`, and a
+  `Conditional` (79) whose case 0 is `prelude.panic` (the unreachable
+  `Option` unwrap-on-None) and case 1 is empty. Zero gates either way.
+
+So it is the single-back-edge shape `_walk_cfg` already supports. The
+header's extra content adds zero gates, and the trip count to supply
+(keyed by header node ID, as for `while`) is just `n`.
+
+**Hand counts vs. walker** (`upper_bound=True`):
+
+| Program | Trip counts | Hand count | Walker |
+|---|---|---|---|
+| range(2), body h,t | {5: 2} | clifford 2, t 2 | same |
+| range(3), body h,t | {5: 3} | clifford 3, t 3 | same |
+| range(5), body h,t | {5: 5} | clifford 5, t 5 | same |
+| same, trip 7 / trip 0 | | 7,7 / 0,0 | same |
+| nested: for 2 { x; for 3 { h; t } } | outer 2, inner 3 | clifford 2+6=8, t 6 | same |
+| same, counts swapped | outer 3, inner 2 | clifford 3+6=9, t 6 | same |
+| sequential: for 2 {h;t}; for 3 {x;h} | 2, 3 | clifford 2+6=8, t 2 | same |
+
+`n_qubits` stayed 1 throughout (gates scale with trip count, qubits don't,
+same as `while`). The swapped nested case confirms that the first header
+`LoopTripCountMissing` names is the outer loop. Default (straight-line)
+mode still raises `ControlFlowNotSupported`.
+
+**Tests.** `test_for_loop_over_range_is_unsupported` (which accepted either
+`UnsupportedControlFlowShape` or `LoopTripCountMissing`, so it couldn't
+tell) is replaced in `tests/test_bounded_control_flow.py` by
+`test_for_loop_over_range_exact_count` (n=2,3,5), `..._nested`,
+`..._sequential`, and `..._needs_upper_bound_in_default_mode`. They
+discover header IDs via `LoopTripCountMissing` and don't hardcode them.
+
+**Not checked:** whether 1.0.2 behaved the same. The old claim was
+probably never observed, since the test accepted either outcome from the
+commit that added it (615850a), but that wasn't rebuilt to confirm. Also
+not checked: `for` over other iterables (e.g. an array), and `range` with
+a runtime (non-constant) bound.
+
 ## Possible future work (not started)
 
 - ~~Support straight-line-with-known-bounds control flow...~~ **Done,
   2026-09-02 — see "Bounded control flow (opt-in)" above.** Remaining gaps
   within that feature (not "future work" so much as known scope limits):
-  `for`-loop/iterator support, loops with internal `break`.
+  `for` over iterables other than `range` (unverified), loops with
+  internal `break`.
 - ~~Follow `ops.Call` edges into non-inlined callees~~ **Done, 2026-09-05 —
   see "Call-following" above.** `CallNotSupported` is narrowed to
   genuinely irresolvable calls (`CallIndirect`, or a `Call` targeting a

@@ -552,7 +552,7 @@ docstrings claim they are** — this goes beyond the "these are two different
 papers stitched together" scope-caveat from the first pass; the data-block
 piece has an actual arithmetic gap against its own citation.
 
-## Recommendation (updated) — resolved 2026-09-01, see CLAUDE.md
+## Recommendation (updated) — resolved 2026-09-01
 
 Both follow-ups below were acted on. **Update (2026-09-01):**
 
@@ -567,8 +567,19 @@ Both follow-ups below were acted on. **Update (2026-09-01):**
    visible runtime + README caveat instead. Full reasoning for treating the
    two differently — #1943 is an unambiguous transcription bug with one
    correct fix, #1944 is a genuine cross-paper modeling-composability choice
-   with no single obviously-correct answer — is in `CLAUDE.md`'s
-   2026-09-01 "Update", not duplicated here. `bell_and_t`'s `n_phys_qubits`
+   with no single obviously-correct answer — in short:
+   - **#1943** has one correct answer. The paper states `1.5n+3` tiles in
+     three separate places, and the code is missing exactly the additive
+     term. The local fix is a small method override, not a monkey-patch.
+   - **#1944** has no single correct answer. Beverland's paper doesn't
+     specify a magic-state factory, and Litinski's factory paper doesn't
+     specify Beverland's hardware/threshold assumptions. Using one
+     logical-error constant across the whole device (Qualtran's choice) is
+     a defensible design, even though it differs from Litinski's own worked
+     example. Patching it would replace Qualtran's judgment with ours, with
+     no stronger claim to being right. A visible caveat is printed instead.
+     (A Qualtran maintainer has since questioned on the issue whether this
+     is a bug at all, which is the outcome this reasoning anticipated.) `bell_and_t`'s `n_phys_qubits`
    is now 4,614 (paper-correct, matches this file's §8 hand computation
    exactly), up from the raw-Qualtran 2,880.
 3. Unchanged from the first pass: if bit-for-bit fidelity to Beverland's own
