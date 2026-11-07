@@ -9,3 +9,5 @@ dist/
 
 # mkdocs build output
 site/
+
+__marimo__/
